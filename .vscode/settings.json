@@ -1,0 +1,28 @@
+{
+    "python.defaultInterpreterPath": "${env:HOME}/workspace/Projects/Zetin-Humanoid-RL-Deploy/.venv/bin/python3",
+
+    "python.languageServer": "Pylance",
+
+    "python.terminal.activateEnvironment": false,
+
+    "[python]": {
+        "files.trimTrailingWhitespace": true,
+        "files.trimFinalNewlines": true,
+        "files.insertFinalNewline": true
+    },
+
+    "files.watcherExclude": {
+        "**/.git/objects/**": true,
+        "**/.git/subtree-cache/**": true
+    },
+
+    "github.copilot.enable": {
+        "python": false
+    },
+
+    "autoDocstring.docstringFormat": "google",
+
+    "python.analysis.extraPaths": [
+        "${env:HOME}/workspace/Projects/Zetin-Humanoid-RL-Deploy/source/Policy-Runner",
+    ],
+}
