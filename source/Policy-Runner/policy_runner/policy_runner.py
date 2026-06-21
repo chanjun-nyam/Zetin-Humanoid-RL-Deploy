@@ -1,5 +1,5 @@
 from dataclasses import dataclass, MISSING
-from typing import List
+from typing import List, Tuple
 
 import torch as th
 import onnxruntime as ort
@@ -28,6 +28,10 @@ class PolicyRunnerCfg:
     n_history: int = MISSING
 
     obs_scale: List[float] = MISSING
+
+    obs_clip: Tuple[float, float] = MISSING
+
+    action_clip: Tuple[float, float] = MISSING
 
     model_path: str = MISSING
 
@@ -173,7 +177,7 @@ class PolicyRunner:
 
         # compute final observation tensor
         obs_tensor = th.cat([
-            self.obs_hist.buff.transpose(0, 1).contiguous().view(-1),
+            self.obs_hist.buff.view(-1),
             command,
             self.obs_priv,
         ], dim=-1)
@@ -184,6 +188,7 @@ class PolicyRunner:
     def policy_step(self, command: th.Tensor) -> th.Tensor:
         # compute observation tensor
         obs_tensor = self._compute_observation(command)
+        obs_tensor.clip_(*self.cfg.obs_clip)
 
         # run onnx session
         session_input = {'input': obs_tensor.unsqueeze(0).numpy()}
@@ -191,6 +196,7 @@ class PolicyRunner:
 
         # compute action tensor
         self.action.copy_(th.from_numpy(session_output[0]).squeeze(0))
+        self.action.clip_(*self.cfg.action_clip)
 
         return self.action * self.q_scale
 

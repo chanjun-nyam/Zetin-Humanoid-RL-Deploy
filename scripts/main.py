@@ -25,6 +25,8 @@ class ControllerCfg:
 
     q_names: List[str] = MISSING
 
+    qpos_default: List[float] = MISSING
+
     q_kp: List[float] = MISSING
 
     q_kd: List[float] = MISSING
@@ -41,6 +43,7 @@ class Controller:
         'policy_runner',
         'robot_type', 'robot',
         '_imu_data', '_robot_state', '_sensor_joy', '_diagnostic_value',
+        '_imu_data_cnt', '_robot_state_cnt', '_sensor_joy_cnt', '_diagnostic_value_cnt',
         'imu_data_callback', 'robot_state_callback', 'sensor_joy_callback', 'robot_diagnostic_callback',
     )
 
@@ -80,6 +83,11 @@ class Controller:
         self._robot_state.dq = [0.0] * self.n_qdim
         self._sensor_joy.axes = [0.0, 0.0, 0.0]
 
+        self._imu_data_cnt = 0
+        self._robot_state_cnt = 0
+        self._sensor_joy_cnt = 0
+        self._diagnostic_value_cnt = 0
+
         # subscribe callbacks
         self._subscribe_callbacks()
 
@@ -95,18 +103,22 @@ class Controller:
 
         def imu_data_callback(imu_data: sdk_dtype.ImuData):
             self._imu_data = imu_data
+            self._imu_data_cnt += 1
         self.imu_data_callback = imu_data_callback
 
         def robot_state_callback(robot_state: sdk_dtype.RobotState):
             self._robot_state = robot_state
+            self._robot_state_cnt += 1
         self.robot_state_callback = robot_state_callback
 
         def sensor_joy_callback(sensor_joy: sdk_dtype.SensorJoy):
             self._sensor_joy = sensor_joy
+            self._sensor_joy_cnt += 1
         self.sensor_joy_callback = sensor_joy_callback
 
         def robot_diagnostic_callback(diagnostic_value: sdk_dtype.DiagnosticValue):
             self._diagnostic_value = diagnostic_value
+            self._diagnostic_value_cnt += 1
         self.robot_diagnostic_callback = robot_diagnostic_callback
 
         self.robot.subscribeImuData(self.imu_data_callback)
@@ -146,14 +158,17 @@ class Controller:
         _robot_cmd.Kp = self._apply_q_map(self.cfg.q_kp)
         _robot_cmd.Kd = self._apply_q_map(self.cfg.q_kd)
 
+        # tensors
+        qpos_default = self._float_tensor(self.cfg.qpos_default)
+
         # main loop
         rate = sdk_robot.Rate(self.cfg.loop_freq)
         step_num = 0
 
+        step_dt = 0.0
+        sim_dt = 0.0
+        policy_dt = 0.0
         total_dt = 0.0
-        step_util = 0.0
-        sim_util = 0.0
-        policy_util = 0.0
 
         while True:
             step_num += 1
@@ -164,6 +179,11 @@ class Controller:
             robot_state = copy.deepcopy(self._robot_state)
             sensor_joy = copy.deepcopy(self._sensor_joy)
             diagnostic_value = copy.deepcopy(self._diagnostic_value)
+
+            imu_data_cnt = int(self._imu_data_cnt)
+            robot_state_cnt = int(self._robot_state_cnt)
+            sensor_joy_cnt = int(self._sensor_joy_cnt)
+            diagnostic_value_cnt = int(self._diagnostic_value_cnt)
 
             # robot data tensors
             quat = self._float_tensor(imu_data.quat)
@@ -178,7 +198,7 @@ class Controller:
 
             # simulation step
             s = time.perf_counter_ns()
-            self.policy_runner.sim_step(quat, angvel, qpos, qvel)
+            self.policy_runner.sim_step(quat, angvel, qpos - qpos_default, qvel)
             sim_dt = (time.perf_counter_ns() - s) / 1e9
 
             # policy step
@@ -188,7 +208,7 @@ class Controller:
                 policy_dt = (time.perf_counter_ns() - s) / 1e9
 
             # write action to robot
-            _robot_cmd.q = self._apply_q_map(qpos_trg.tolist())
+            _robot_cmd.q = self._apply_q_map((qpos_default + qpos_trg).tolist())
             self.robot.publishRobotCmd(_robot_cmd)
 
             # logging
@@ -199,19 +219,25 @@ class Controller:
                     f'joy-axes: {sensor_joy.axes}\n'
                     f'joy-buttons: {sensor_joy.buttons}\n'
                     f'motor-names: {robot_state.motor_names}\n'
-                    f'total_util: {total_dt * self.cfg.loop_freq:.4f}\n'
-                    f'step_util: {step_util:.3f}, sim_util: {sim_util:.3f}, policy_util: {policy_util:.3f}\n'
-                )
 
-            # compute time related variables
+                    f'total-util: {total_dt * self.cfg.loop_freq:.4f} | '
+                    f'step-util: {step_dt * self.cfg.loop_freq:.4f} | '
+                    f'sim-util: {sim_dt * self.cfg.loop_freq:.4f} | '
+                    f'policy-util: {policy_dt * self.cfg.loop_freq:.4f}\n'
+
+                    f'cnt: {imu_data_cnt} | {robot_state_cnt} | {sensor_joy_cnt} | {diagnostic_value_cnt}\n'
+
+                    f'quat: {quat}\n'
+                    f'angvel: {angvel}\n'
+                    f'qpos: {qpos}\n'
+                    f'qvel: {qvel}\n'
+                    f'qpos_trg: {qpos_trg}\n'
+                ) # TODO
+
+            # fix loop delta-time
             step_dt = (time.perf_counter_ns() - step_ns) / 1e9
             rate.sleep()
             total_dt = (time.perf_counter_ns() - step_ns) / 1e9
-
-            step_util = step_dt / total_dt
-            sim_util = sim_dt / total_dt
-            if step_num % self.decimation == 0:
-                policy_util = policy_dt / total_dt
 
 
 
@@ -228,28 +254,42 @@ if __name__ == '__main__':
         'ankle_L_Joint','ankle_R_Joint',
     ]
 
+    LOOP_FREQ = 500
+    POLICY_FREQ = 50
+    LOG_FREQ = 1
+
     # controller configuration
     controller_cfg = ControllerCfg(
         robot_ip='127.0.0.1',
         # robot_ip='10.192.1.2',
 
-        loop_freq=500,
-        logging_steps=100, # 500 / 100 = 5Hz
+        loop_freq=LOOP_FREQ,
+        logging_steps=LOOP_FREQ // LOG_FREQ,
 
         ref_q_names=SDK_Q_NAMES,
         q_names=USD_Q_NAMES,
+
+        qpos_default=[
+            0.0, 0.0,
+            0.0, 0.0,
+            # 0.13, -0.13, # TODO
+            0.0, 0.0,
+            0.0, 0.0,
+        ],
 
         q_kp=[45.0] * 8,
         q_kd=[1.5] * 6 + [0.8] * 2,
 
         policy_runner_cfg=PolicyRunnerCfg(
-            decimation=10,
+            decimation=LOOP_FREQ // POLICY_FREQ,
             device='cpu',
             ref_q_names=USD_Q_NAMES,
             q_names=USD_Q_NAMES,
             q_scale=[0.5] * 8,
             n_history=10,
             obs_scale=[0.25, 1.0, 1.0, 0.05, 1.0, 1.0],
+            obs_clip=(-2.0, 2.0),
+            action_clip=(-2.0, 2.0),
             model_path='models/tron1_0_s_rough.onnx',
         ),
     )
