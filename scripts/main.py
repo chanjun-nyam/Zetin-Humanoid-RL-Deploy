@@ -216,8 +216,8 @@ class Controller:
                 print(
                     f'[controller-log]\n'
                     f'step-num: {step_num}\n'
-                    f'joy-axes: {sensor_joy.axes}\n'
-                    f'joy-buttons: {sensor_joy.buttons}\n'
+                    f'joy-axes: {" | ".join([f"{x:6.3f}" for x in sensor_joy.axes])}\n'
+                    f'joy-buttons: {" | ".join([f"{x}" for x in sensor_joy.buttons])}\n'
                     f'motor-names: {robot_state.motor_names}\n'
 
                     f'total-util: {total_dt * self.cfg.loop_freq:.4f} | '
@@ -227,11 +227,11 @@ class Controller:
 
                     f'cnt: {imu_data_cnt} | {robot_state_cnt} | {sensor_joy_cnt} | {diagnostic_value_cnt}\n'
 
-                    f'quat: {quat}\n'
-                    f'angvel: {angvel}\n'
-                    f'qpos: {qpos}\n'
-                    f'qvel: {qvel}\n'
-                    f'qpos_trg: {qpos_trg}\n'
+                    f'quat: {" | ".join([f"{x:6.3f}" for x in quat])}\n'
+                    f'angvel: {" | ".join([f"{x:6.3f}" for x in angvel])}\n'
+                    f'qpos: {" | ".join([f"{x:6.3f}" for x in qpos])}\n'
+                    f'qvel: {" | ".join([f"{x:6.3f}" for x in qvel])}\n'
+                    f'qtrg: {" | ".join([f"{x:6.3f}" for x in qpos_trg])}\n'
                 ) # TODO
 
             # fix loop delta-time
@@ -256,7 +256,7 @@ if __name__ == '__main__':
 
     LOOP_FREQ = 500
     POLICY_FREQ = 50
-    LOG_FREQ = 1
+    LOG_FREQ = 10
 
     # controller configuration
     controller_cfg = ControllerCfg(
