@@ -228,7 +228,7 @@ class Controller:
                     f'cnt: {imu_data_cnt} | {robot_state_cnt} | {sensor_joy_cnt} | {diagnostic_value_cnt}\n'
 
                     f'quat: {" | ".join([f"{x:6.3f}" for x in quat])}\n'
-                    f'angvel: {" | ".join([f"{x:6.3f}" for x in angvel])}\n'
+                    f'avel: {" | ".join([f"{x:6.3f}" for x in angvel])}\n'
                     f'qpos: {" | ".join([f"{x:6.3f}" for x in qpos])}\n'
                     f'qvel: {" | ".join([f"{x:6.3f}" for x in qvel])}\n'
                     f'qtrg: {" | ".join([f"{x:6.3f}" for x in qpos_trg])}\n'
