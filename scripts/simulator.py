@@ -15,6 +15,8 @@ class SimulatorCfg:
 
     mjcf_path: str = MISSING
 
+    rendering: bool = MISSING
+
     sim_freq: int = MISSING
 
     rend_freq: int = MISSING
@@ -47,7 +49,9 @@ class Simulator:
         # init mujoco
         self.mj_model = mj.MjModel.from_xml_path(self.cfg.mjcf_path)
         self.mj_data = mj.MjData(self.mj_model)
-        self.mj_viewer = mj.viewer.launch_passive(self.mj_model, self.mj_data) if False else None # TODO
+        self.mj_viewer = None
+        if cfg.rendering:
+            self.mj_viewer = mj.viewer.launch_passive(self.mj_model, self.mj_data)
 
         self.mj_model.opt.timestep = 1 / cfg.sim_freq
 
@@ -71,7 +75,7 @@ class Simulator:
         from_q_ref = [ref_q_names.index(x) for x in q_names]
 
         # preprocess: sensor data indices
-        sensor_names = ['quat', 'gyro']#, 'acc']
+        sensor_names = ['quat', 'gyro', 'acc']
         sensor_ids = [mj.mj_name2id(mj_model, mj.mjtObj.mjOBJ_SENSOR, x) for x in sensor_names]
         sensor_slices = [
             slice(mj_model.sensor_adr[x], mj_model.sensor_adr[x] + mj_model.sensor_dim[x])
@@ -82,6 +86,8 @@ class Simulator:
         # buffers
         qpos_default = float_tensor(self.cfg.qpos_default)
         qpos_trg = float_tensor([0.0] * len(self.cfg.qpos_default))
+        q_kp = float_tensor(self.cfg.q_kp)
+        q_kd = float_tensor(self.cfg.q_kd)
 
         # main loop
         step_num = 0
@@ -117,7 +123,8 @@ class Simulator:
                 policy_dt = (time.perf_counter_ns() - s) / 1e9
 
             # write action to robot
-            mj_data.ctrl[:] = qpos_trg[to_q_ref].numpy()
+            qtau = q_kp * (qpos_trg - qpos) - q_kd * qvel
+            mj_data.ctrl[:] = qtau[to_q_ref].numpy()
 
             # rendering
             if step_num % self.rend_decimation == 0:
@@ -162,6 +169,7 @@ if __name__ == '__main__':
     # controller configuration
     simulator_cfg = SimulatorCfg(
         mjcf_path='robot-description/pointfoot/SF_TRON1B/xml/robot.xml',
+        rendering=True,
 
         sim_freq=500,
         rend_freq=50,
