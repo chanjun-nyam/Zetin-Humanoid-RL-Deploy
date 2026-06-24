@@ -75,7 +75,7 @@ class Simulator:
         from_q_ref = [ref_q_names.index(x) for x in q_names]
 
         # preprocess: sensor data indices
-        sensor_names = ['quat', 'gyro', 'acc']
+        sensor_names = ['quat', 'linvel', 'linacc', 'angvel']
         sensor_ids = [mj.mj_name2id(mj_model, mj.mjtObj.mjOBJ_SENSOR, x) for x in sensor_names]
         sensor_slices = [
             slice(mj_model.sensor_adr[x], mj_model.sensor_adr[x] + mj_model.sensor_dim[x])
@@ -88,6 +88,8 @@ class Simulator:
         qpos_trg = float_tensor([0.0] * len(self.cfg.qpos_default))
         q_kp = float_tensor(self.cfg.q_kp)
         q_kd = float_tensor(self.cfg.q_kd)
+
+        usr_cmd = float_tensor([0.0, 0.0, 0.0])
 
         # main loop
         step_num = 0
@@ -106,14 +108,14 @@ class Simulator:
 
             # tensors
             quat = th.from_numpy(mj_data.sensordata[sensor_name2slice['quat']])
-            gyro = th.from_numpy(mj_data.sensordata[sensor_name2slice['gyro']])
+            linvel = th.from_numpy(mj_data.sensordata[sensor_name2slice['linvel']])
+            angvel = th.from_numpy(mj_data.sensordata[sensor_name2slice['angvel']])
             qpos = th.from_numpy(mj_data.qpos[7:])[from_q_ref]
             qvel = th.from_numpy(mj_data.qvel[6:])[from_q_ref]
-            usr_cmd = float_tensor([0.0, 0.0, 0.0])
 
             # step policy-runner
             s = time.perf_counter_ns()
-            self.policy_runner.sim_step(quat, gyro, qpos - qpos_default, qvel)
+            self.policy_runner.sim_step(quat, linvel, angvel, qpos - qpos_default, qvel * 2)
             sim_dt = (time.perf_counter_ns() - s) / 1e9
 
             # policy step
@@ -142,10 +144,11 @@ class Simulator:
                     f'sim-util: {sim_dt * self.cfg.sim_freq:.4f} | '
                     f'policy-util: {policy_dt * self.cfg.sim_freq:.4f}\n'
 
-                    f'quat: {" | ".join([f"{x:6.3f}" for x in quat])}\n'
-                    f'gyro: {" | ".join([f"{x:6.3f}" for x in gyro])}\n'
-                    f'qpos: {" | ".join([f"{x:6.3f}" for x in qpos])}\n'
-                    f'qvel: {" | ".join([f"{x:6.3f}" for x in qvel])}\n'
+                    f'quat: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.quat])}\n'
+                    f'linv: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.linvel.sma])}\n'
+                    f'angv: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.angvel.sma])}\n'
+                    f'qpos: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.qpos])}\n'
+                    f'qvel: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.qvel.sma])}\n'
                     f'qtrg: {" | ".join([f"{x:6.3f}" for x in qpos_trg])}\n'
                 )
 
@@ -166,14 +169,19 @@ if __name__ == '__main__':
         'ankle_L_Joint','ankle_R_Joint',
     ]
 
+    SIM_FREQ = 500
+    POLICY_FREQ = 50
+    REND_FREQ = 50
+    LOG_FREQ = 10
+
     # controller configuration
     simulator_cfg = SimulatorCfg(
-        mjcf_path='robot-description/pointfoot/SF_TRON1B/xml/robot.xml',
-        rendering=True,
+        mjcf_path='assets/Tron1-S/robot.xml',
+        rendering=False,
 
-        sim_freq=500,
-        rend_freq=50,
-        log_freq=10,
+        sim_freq=SIM_FREQ,
+        rend_freq=REND_FREQ,
+        log_freq=LOG_FREQ,
 
         q_names=USD_Q_NAMES,
         qpos_default=[
@@ -183,11 +191,11 @@ if __name__ == '__main__':
             0.0, 0.0,
             0.0, 0.0,
         ],
-        q_kp=[45.0] * 8,
-        q_kd=[1.5] * 6 + [0.8] * 2,
+        q_kp=[45., 45., 45., 45., 45., 45., 45., 45.],
+        q_kd=[1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 0.8, 0.8],
 
         policy_runner_cfg=PolicyRunnerCfg(
-            decimation=10,
+            decimation=SIM_FREQ // POLICY_FREQ,
             device='cpu',
             ref_q_names=USD_Q_NAMES,
             q_names=USD_Q_NAMES,
@@ -201,10 +209,6 @@ if __name__ == '__main__':
             # model_path='models/tron1_0_s_flat_2.onnx',
         ),
     )
-
-    # setup environment variable (limxsdk-lowlevel requires this)
-    import os
-    os.environ['ROBOT_TYPE'] = 'SF_TRON1B'
 
     # run controller
     simulator = Simulator(simulator_cfg)

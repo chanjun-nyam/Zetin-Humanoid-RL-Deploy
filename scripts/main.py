@@ -288,9 +288,11 @@ if __name__ == '__main__':
             q_scale=[0.5] * 8,
             n_history=10,
             obs_scale=[0.25, 1.0, 1.0, 0.05, 1.0, 1.0],
-            obs_clip=(-2.0, 2.0),
-            action_clip=(-2.0, 2.0),
-            model_path='models/tron1_0_s_rough.onnx',
+            obs_clip=(-5.0, 5.0),
+            action_clip=(-5.0, 5.0),
+            # model_path='models/tron1_0_s_rough.onnx',
+            # model_path='models/tron1_0_s_flat_.onnx',
+            model_path='models/tron1_0_s_flat_2.onnx',
         ),
     )
 

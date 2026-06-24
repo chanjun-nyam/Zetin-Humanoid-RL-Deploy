@@ -44,7 +44,7 @@ class PolicyRunner:
         'session',
         'n_qdim', 'n_obs_t', 'n_obs_priv',
         'QUAT_IDENTITY', 'GRAV_W',
-        'quat', 'angvel', 'qpos', 'qvel', 'action',
+        'quat', 'linvel', 'angvel', 'qpos', 'qvel', 'action',
         'obs_t', 'obs_priv', 'obs_hist',
         'q_scale',
     )
@@ -110,11 +110,13 @@ class PolicyRunner:
         self.GRAV_W = th.tensor([0, 0, -1], dtype=th.float32, device=self.device)
 
         self.quat = self.QUAT_IDENTITY.clone()
+        self.linvel = _zeros(3)
         self.angvel = _zeros(3)
         self.qpos = _zeros(self.n_qdim)
         self.qvel = _zeros(self.n_qdim)
         self.action = _zeros(self.n_qdim)
 
+        self.linvel = SMABuffer.init_like(self.linvel, (0,), self.cfg.decimation)
         self.angvel = SMABuffer.init_like(self.angvel, (0,), self.cfg.decimation)
         self.qvel = SMABuffer.init_like(self.qvel, (0,), self.cfg.decimation)
 
@@ -134,6 +136,7 @@ class PolicyRunner:
     def sim_step(
             self,
             quat: th.Tensor,
+            linvel: th.Tensor,
             angvel: th.Tensor,
             qpos: th.Tensor,
             qvel: th.Tensor,
@@ -146,13 +149,14 @@ class PolicyRunner:
         self.quat.copy_(quat)
         self.qpos.copy_(qpos)
 
+        self.linvel.update(linvel)
         self.angvel.update(angvel)
         self.qvel.update(qvel)
 
 
     def _compute_observation(self, command: th.Tensor) -> th.Tensor:
+        linvel = self.linvel.sma
         angvel = self.angvel.sma
-        linvel = th.zeros_like(angvel) # TODO
         qpos = self.qpos
         qvel = self.qvel.sma
         action = self.action
@@ -181,6 +185,7 @@ class PolicyRunner:
             command,
             self.obs_priv,
         ], dim=-1)
+        obs_tensor[-3:] = 0.0 # TODO
 
         return obs_tensor
 
@@ -207,6 +212,7 @@ class PolicyRunner:
         self.qpos.zero_()
         self.action.zero_()
 
+        self.linvel.reset(())
         self.angvel.reset(())
         self.qvel.reset(())
 
