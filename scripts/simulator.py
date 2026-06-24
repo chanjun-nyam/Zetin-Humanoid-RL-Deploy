@@ -1,12 +1,18 @@
+import os
+
+# offscreen rendering backend (set before mujoco creates any gl context).
+# 'egl' for headless gpu servers, 'osmesa' for cpu-only. override via env var.
+os.environ.setdefault('MUJOCO_GL', 'egl')
+
 from dataclasses import dataclass, MISSING
-from typing import List
+from typing import Callable, List, Optional
 import time
 
 import mujoco as mj
-import mujoco.viewer
 import torch as th
 
 from policy_runner import PolicyRunner, PolicyRunnerCfg
+from web_stream import WebStreamServer, WebStreamCfg
 
 
 
@@ -14,8 +20,6 @@ from policy_runner import PolicyRunner, PolicyRunnerCfg
 class SimulatorCfg:
 
     mjcf_path: str = MISSING
-
-    rendering: bool = MISSING
 
     sim_freq: int = MISSING
 
@@ -43,24 +47,32 @@ class Simulator:
         self.rend_decimation = cfg.sim_freq // cfg.rend_freq
         self.log_decimation = cfg.sim_freq // cfg.log_freq
 
+        # rendering / user-command hooks (registered via register_* methods below)
+        self._render_callback: Optional[Callable] = None
+        self._cmd_callback: Optional[Callable] = None
+
         # init policy-runner
         self.policy_runner = PolicyRunner(cfg.policy_runner_cfg)
 
         # init mujoco
         self.mj_model = mj.MjModel.from_xml_path(self.cfg.mjcf_path)
         self.mj_data = mj.MjData(self.mj_model)
-        self.mj_viewer = None
-        if cfg.rendering:
-            self.mj_viewer = mj.viewer.launch_passive(self.mj_model, self.mj_data)
 
         self.mj_model.opt.timestep = 1 / cfg.sim_freq
+
+
+    def register_render_callback(self, callback: Callable):
+        self._render_callback = callback
+
+
+    def register_cmd_callback(self, callback: Callable):
+        self._cmd_callback = callback
 
 
     def run(self):
 
         mj_model = self.mj_model
         mj_data = self.mj_data
-        mj_viewer = self.mj_viewer
 
         dtype = th.float32
         device = th.device(self.cfg.policy_runner_cfg.device)
@@ -97,6 +109,7 @@ class Simulator:
         step_dt = 0.0
         sim_dt = 0.0
         policy_dt = 0.0
+        rend_dt = 0.0
         total_dt = 0.0
 
         while True:
@@ -128,10 +141,14 @@ class Simulator:
             qtau = q_kp * (qpos_trg - qpos) - q_kd * qvel
             mj_data.ctrl[:] = qtau[to_q_ref].numpy()
 
-            # rendering
+            # render-rate hooks: pull user-command, push rendered frame
             if step_num % self.rend_decimation == 0:
-                if mj_viewer is not None:
-                    mj_viewer.sync()
+                s = time.perf_counter_ns()
+                if self._cmd_callback is not None:
+                    usr_cmd = float_tensor(self._cmd_callback())
+                if self._render_callback is not None:
+                    self._render_callback(mj_model, mj_data)
+                rend_dt = (time.perf_counter_ns() - s) / 1e9
 
             # logging
             if step_num % self.log_decimation == 0:
@@ -142,7 +159,8 @@ class Simulator:
                     f'total-util: {total_dt * self.cfg.sim_freq:.4f} | '
                     f'step-util: {step_dt * self.cfg.sim_freq:.4f} | '
                     f'sim-util: {sim_dt * self.cfg.sim_freq:.4f} | '
-                    f'policy-util: {policy_dt * self.cfg.sim_freq:.4f}\n'
+                    f'policy-util: {policy_dt * self.cfg.sim_freq:.4f} | '
+                    f'rend-util: {rend_dt * self.cfg.sim_freq:.4f}\n'
 
                     f'quat: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.quat])}\n'
                     f'linv: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.linvel.sma])}\n'
@@ -150,6 +168,7 @@ class Simulator:
                     f'qpos: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.qpos])}\n'
                     f'qvel: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.qvel.sma])}\n'
                     f'qtrg: {" | ".join([f"{x:6.3f}" for x in qpos_trg])}\n'
+                    f'ucmd: {" | ".join([f"{x:6.3f}" for x in usr_cmd])}\n'
                 )
 
             # fix loop delta-time
@@ -169,7 +188,7 @@ if __name__ == '__main__':
         'ankle_L_Joint','ankle_R_Joint',
     ]
 
-    SIM_FREQ = 500
+    SIM_FREQ = 300
     POLICY_FREQ = 50
     REND_FREQ = 50
     LOG_FREQ = 10
@@ -177,7 +196,6 @@ if __name__ == '__main__':
     # controller configuration
     simulator_cfg = SimulatorCfg(
         mjcf_path='assets/Tron1-S/robot.xml',
-        rendering=False,
 
         sim_freq=SIM_FREQ,
         rend_freq=REND_FREQ,
@@ -204,12 +222,32 @@ if __name__ == '__main__':
             obs_scale=[0.25, 1.0, 1.0, 0.05, 1.0, 1.0],
             obs_clip=(-5.0, 5.0),
             action_clip=(-5.0, 5.0),
-            model_path='models/tron1_0_s_rough.onnx',
-            # model_path='models/tron1_0_s_flat_.onnx',
+            # model_path='models/tron1_0_s_rough.onnx',
+            model_path='models/tron1_0_s_flat_.onnx',
             # model_path='models/tron1_0_s_flat_2.onnx',
         ),
     )
 
-    # run controller
+    # build simulator
     simulator = Simulator(simulator_cfg)
+
+    # web stream server: offscreen rendering + 3 user-command sliders,
+    # reachable over an ssh-forwarded tcp port (default 8000).
+    web_stream = WebStreamServer(
+        cfg = WebStreamCfg(
+            host='0.0.0.0',
+            port=8000,
+            width=600,
+            height=400,
+            camera='track',
+            jpeg_quality=80,
+            stream_freq=REND_FREQ,
+        )
+    )
+
+    # register rendering + user-command as callbacks on the simulator
+    simulator.register_render_callback(web_stream.render_frame)
+    simulator.register_cmd_callback(web_stream.get_cmd)
+
+    # run controller
     simulator.run()
