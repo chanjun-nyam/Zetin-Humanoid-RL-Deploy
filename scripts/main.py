@@ -170,6 +170,8 @@ class Controller:
         policy_dt = 0.0
         total_dt = 0.0
 
+        is_on = False # TODO
+
         while True:
             step_num += 1
             step_ns = time.perf_counter_ns()
@@ -195,6 +197,7 @@ class Controller:
                 sensor_joy.axes[0], # linear-y
                 sensor_joy.axes[2], # angular-z
             ])
+            is_on = is_on and not (sensor_joy.buttons[1231] == 1)
 
             # simulation step
             s = time.perf_counter_ns()
@@ -208,8 +211,14 @@ class Controller:
                 policy_dt = (time.perf_counter_ns() - s) / 1e9
 
             # write action to robot
+            if not is_on:
+                _robot_cmd.Kp = [0.0] * len(_robot_cmd.Kp)
+                _robot_cmd.Kd = [0.0] * len(_robot_cmd.Kd)
             _robot_cmd.q = self._apply_q_map((qpos_default + qpos_trg).tolist())
             self.robot.publishRobotCmd(_robot_cmd)
+
+            if not is_on:
+                self.robot.setRobotLightEffect(sdk_dtype.LightEffect.STATIC_RED)
 
             # logging
             if step_num % self.cfg.logging_steps == 1:
@@ -291,8 +300,8 @@ if __name__ == '__main__':
             obs_clip=(-100.0, 100.0),
             action_clip=(-100.0, 100.0),
             # model_path='models/tron1_0_s_rough.onnx',
-            # model_path='models/tron1_0_s_flat_.onnx',
-            model_path='models/tron1_0_s_flat_2.onnx',
+            model_path='models/tron1_0_s_flat_.onnx',
+            # model_path='models/tron1_0_s_flat_2.onnx',
         ),
     )
 
