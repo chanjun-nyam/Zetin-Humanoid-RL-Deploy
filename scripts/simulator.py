@@ -103,6 +103,9 @@ class Simulator:
 
         usr_cmd = float_tensor([0.0, 0.0, 0.0])
 
+        from policy_runner.utils import SMABuffer
+        vel_buff = SMABuffer.init_like(usr_cmd, (0,), self.cfg.sim_freq)
+
         # main loop
         step_num = 0
 
@@ -126,9 +129,11 @@ class Simulator:
             qpos = th.from_numpy(mj_data.qpos[7:])[from_q_ref]
             qvel = th.from_numpy(mj_data.qvel[6:])[from_q_ref]
 
+            vel_buff.update(th.cat([linvel[0:2], angvel[2:3]]))
+
             # step policy-runner
             s = time.perf_counter_ns()
-            self.policy_runner.sim_step(quat, linvel, angvel, qpos - qpos_default, qvel * 2)
+            self.policy_runner.sim_step(quat, linvel, angvel, qpos - qpos_default, qvel)
             sim_dt = (time.perf_counter_ns() - s) / 1e9
 
             # policy step
@@ -136,6 +141,17 @@ class Simulator:
                 s = time.perf_counter_ns()
                 qpos_trg = self.policy_runner.policy_step(usr_cmd) + qpos_default
                 policy_dt = (time.perf_counter_ns() - s) / 1e9
+                if False:
+                    print(
+                        # f'mujoco '
+                        # f'quat: {" | ".join([f"{x:6.3f}" for x in quat])}     '
+                        # f'linv: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.linvel.sma])}     '
+                        # f'angv: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.angvel.sma])}     '
+                        # f'qpos: {" | ".join([f"{x:6.3f}" for x in qpos])}     '
+                        # f'qvel: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.qvel.sma])}     '
+                        # f'qtrg: {" | ".join([f"{x:6.3f}" for x in qpos_trg])}     '
+                        f'qtau: {" | ".join([f"{x:6.3f}" for x in qtau])}'
+                    )
 
             # write action to robot
             qtau = q_kp * (qpos_trg - qpos) - q_kd * qvel
@@ -146,12 +162,13 @@ class Simulator:
                 s = time.perf_counter_ns()
                 if self._cmd_callback is not None:
                     usr_cmd = float_tensor(self._cmd_callback())
+                    usr_cmd[0] *= 1.5 # x-linear velocity 는 max +-1.5m/s
                 if self._render_callback is not None:
                     self._render_callback(mj_model, mj_data)
                 rend_dt = (time.perf_counter_ns() - s) / 1e9
 
             # logging
-            if step_num % self.log_decimation == 0:
+            if step_num % self.log_decimation == 0 and True:
                 print(
                     f'[controller-log]\n'
                     f'step-num: {step_num}\n'
@@ -164,10 +181,12 @@ class Simulator:
 
                     f'quat: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.quat])}\n'
                     f'linv: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.linvel.sma])}\n'
+                    f'avel: {" | ".join([f"{x:6.3f}" for x in vel_buff.sma])}\n'
                     f'angv: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.angvel.sma])}\n'
                     f'qpos: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.qpos])}\n'
                     f'qvel: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.qvel.sma])}\n'
                     f'qtrg: {" | ".join([f"{x:6.3f}" for x in qpos_trg])}\n'
+                    f'qtau: {" | ".join([f"{x:6.3f}" for x in qtau])}\n'
                     f'ucmd: {" | ".join([f"{x:6.3f}" for x in usr_cmd])}\n'
                 )
 
@@ -220,8 +239,8 @@ if __name__ == '__main__':
             q_scale=[0.5] * 8,
             n_history=10,
             obs_scale=[0.25, 1.0, 1.0, 0.05, 1.0, 1.0],
-            obs_clip=(-5.0, 5.0),
-            action_clip=(-5.0, 5.0),
+            obs_clip=(-100.0, 100.0),
+            action_clip=(-100.0, 100.0),
             # model_path='models/tron1_0_s_rough.onnx',
             model_path='models/tron1_0_s_flat_.onnx',
             # model_path='models/tron1_0_s_flat_2.onnx',
