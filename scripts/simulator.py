@@ -60,7 +60,7 @@ class Simulator:
         self.mj_model = mj.MjModel.from_xml_path(self.cfg.mjcf_path)
         self.mj_data = mj.MjData(self.mj_model)
 
-        self.mj_model.opt.timestep = 1 / cfg.sim_freq
+        self.mj_model.opt.timestep = 1.0 / cfg.sim_freq
 
 
     def register_render_callback(self, callback: Callable):
@@ -72,7 +72,6 @@ class Simulator:
 
 
     def run(self):
-
         mj_model = self.mj_model
         mj_data = self.mj_data
 
@@ -80,6 +79,8 @@ class Simulator:
         device = th.device(self.cfg.policy_runner_cfg.device)
         def float_tensor(x):
             return th.tensor(x, dtype=dtype, device=device)
+
+        policy = self.policy_runner
 
         # preprocess: q-related quantaties
         ref_q_names = [mj.mj_id2name(mj_model, mj.mjtObj.mjOBJ_JOINT, i) for i in range(mj_model.njnt)][1:]
@@ -99,19 +100,18 @@ class Simulator:
 
         # buffers
         qpos_default = float_tensor(self.cfg.qpos_default)
-        qpos_trg = float_tensor([0.0] * len(self.cfg.qpos_default))
         q_kp = float_tensor(self.cfg.q_kp)
         q_kd = float_tensor(self.cfg.q_kd)
 
         gait_theta = float_tensor([0.0, 0.0])
 
         usr_cmd = [
-            0.0,
-            0.0,
-            0.0,
-            1.4,
-            0.5,
-            th.pi,
+            0.0, # linvel-x
+            0.0, # linvel-y
+            0.0, # angvel-z
+            0.0, # gait frequency
+            0.5, # gait ratio
+            th.pi, # gait offset
         ]
 
         from policy_runner.utils import SMABuffer
@@ -141,6 +141,7 @@ class Simulator:
             qvel = th.from_numpy(mj_data.qvel[6:])[from_q_ref]
 
             # gait
+            vel_cmd = float_tensor(usr_cmd[0:3])
             gait_freq = float_tensor(usr_cmd[3])
             gait_ratio = float_tensor(usr_cmd[4])
             gait_offset = float_tensor(usr_cmd[5])
@@ -150,37 +151,28 @@ class Simulator:
             gait_theta.remainder_(2.0 * th.pi)
 
             # apply zero-cmd
-            is_zero = float_tensor(usr_cmd[0:3]).square().sum(dim=0).sqrt() < self.cfg.zero_cmd_norm
-            is_stand = is_zero
-            is_walk = is_stand.logical_not()
+            is_walk = float_tensor(usr_cmd[0:3]).square().sum(dim=0).sqrt() > self.cfg.zero_cmd_norm
+            vel_cmd *= is_walk
             gait_freq *= is_walk
 
             vel_buff.update(th.cat([linvel[0:2], angvel[2:3]]))
 
             # step policy-runner
             s = time.perf_counter_ns()
-            self.policy_runner.sim_step(quat, linvel, angvel, qpos - qpos_default, qvel)
+            policy.sim_step(quat, linvel, angvel, qpos - qpos_default, qvel)
             sim_dt = (time.perf_counter_ns() - s) / 1e9
 
             # policy step
             if step_num % self.policy_decimation == 0:
+                command = th.cat([vel_cmd, th.stack([gait_freq, gait_ratio, gait_offset])], dim=-1)
+                clock = th.cat([gait_theta.sin(), gait_theta.cos()], dim=-1)
+
                 s = time.perf_counter_ns()
-                command = float_tensor(usr_cmd[:5])
-                qpos_trg = self.policy_runner.policy_step(command, gait_theta.sin() * is_walk, gait_theta.cos() * is_walk) + qpos_default
+                policy.policy_step(command[0:5], clock * is_walk)
                 policy_dt = (time.perf_counter_ns() - s) / 1e9
-                if False:
-                    print(
-                        # f'mujoco '
-                        # f'quat: {" | ".join([f"{x:6.3f}" for x in quat])}     '
-                        # f'linv: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.linvel.sma])}     '
-                        # f'angv: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.angvel.sma])}     '
-                        # f'qpos: {" | ".join([f"{x:6.3f}" for x in qpos])}     '
-                        # f'qvel: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.qvel.sma])}     '
-                        # f'qtrg: {" | ".join([f"{x:6.3f}" for x in qpos_trg])}     '
-                        f'qtau: {" | ".join([f"{x:6.3f}" for x in qtau])}'
-                    )
 
             # write action to robot
+            qpos_trg = qpos_default + policy.action * policy.q_scale
             qtau = q_kp * (qpos_trg - qpos) - q_kd * qvel
             mj_data.ctrl[:] = qtau[to_q_ref].numpy()
 
@@ -196,7 +188,7 @@ class Simulator:
             # logging
             if step_num % self.log_decimation == 0:
                 print(
-                    f'[controller-log]\n'
+                    f'[simulator]\n'
                     f'step-num: {step_num}\n'
 
                     f'total-util: {total_dt * self.cfg.sim_freq:.4f} | '
@@ -205,12 +197,12 @@ class Simulator:
                     f'policy-util: {policy_dt * self.cfg.sim_freq:.4f} | '
                     f'rend-util: {rend_dt * self.cfg.sim_freq:.4f}\n'
 
-                    f'quat: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.quat])}\n'
-                    f'linv: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.linvel.sma])}\n'
-                    f'avel: {" | ".join([f"{x:6.3f}" for x in vel_buff.sma])}\n'
-                    f'angv: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.angvel.sma])}\n'
-                    f'qpos: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.qpos])}\n'
-                    f'qvel: {" | ".join([f"{x:6.3f}" for x in self.policy_runner.qvel.sma])}\n'
+                    f'quat: {" | ".join([f"{x:6.3f}" for x in policy.quat])}\n'
+                    f'lvel: {" | ".join([f"{x:6.3f}" for x in policy.linvel.sma])}\n'
+                    f'avel: {" | ".join([f"{x:6.3f}" for x in policy.angvel.sma])}\n'
+                    f'avgv: {" | ".join([f"{x:6.3f}" for x in vel_buff.sma])}\n'
+                    f'qpos: {" | ".join([f"{x:6.3f}" for x in policy.qpos])}\n'
+                    f'qvel: {" | ".join([f"{x:6.3f}" for x in policy.qvel.sma])}\n'
                     f'qtrg: {" | ".join([f"{x:6.3f}" for x in qpos_trg])}\n'
                     f'qtau: {" | ".join([f"{x:6.3f}" for x in qtau])}\n'
                     f'ucmd: {" | ".join([f"{x:6.3f}" for x in usr_cmd])}\n'
@@ -233,7 +225,7 @@ if __name__ == '__main__':
         'ankle_L_Joint','ankle_R_Joint',
     ]
 
-    SIM_FREQ = 300
+    SIM_FREQ = 400
     POLICY_FREQ = 50
     REND_FREQ = 50
     LOG_FREQ = 10
@@ -247,15 +239,10 @@ if __name__ == '__main__':
         log_freq=LOG_FREQ,
 
         q_names=USD_Q_NAMES,
-        qpos_default=[
-            0.0, 0.0,
-            0.0, 0.0,
-            # 0.13, -0.13, # TODO
-            0.0, 0.0,
-            0.0, 0.0,
-        ],
+        qpos_default=[0.0] * 8,
         q_kp=[45., 45., 45., 45., 45., 45., 45., 45.],
         q_kd=[1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 0.8, 0.8],
+
         zero_cmd_norm=0.2,
 
         policy_runner_cfg=PolicyRunnerCfg(
@@ -268,7 +255,7 @@ if __name__ == '__main__':
             obs_scale=[0.25, 1.0, 1.0, 0.05, 1.0, 1.0],
             obs_clip=(-100.0, 100.0),
             action_clip=(-100.0, 100.0),
-            model_path='models/model_4000.onnx',
+            model_path='models/tron1_s_flat.onnx',
         ),
     )
 

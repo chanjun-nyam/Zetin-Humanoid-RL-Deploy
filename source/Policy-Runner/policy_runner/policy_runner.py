@@ -12,7 +12,7 @@ from policy_runner.math_utils import (
 
 
 
-@dataclass(slots=True)
+@dataclass
 class PolicyRunnerCfg:
 
     decimation: int = MISSING
@@ -38,17 +38,6 @@ class PolicyRunnerCfg:
 
 
 class PolicyRunner:
-    __slots__ = (
-        'cfg', 'device',
-        '_buff_initialized',
-        'session',
-        'n_qdim', 'n_obs_t', 'n_obs_priv',
-        'QUAT_IDENTITY', 'GRAV_W',
-        'quat', 'linvel', 'angvel', 'qpos', 'qvel', 'action',
-        'obs_t', 'obs_priv', 'obs_hist',
-        'q_scale',
-    )
-
 
     def __init__(self, cfg: PolicyRunnerCfg):
         self.cfg = cfg
@@ -154,7 +143,7 @@ class PolicyRunner:
         self.qvel.update(qvel)
 
 
-    def _compute_observation(self, command: th.Tensor, clock_sin: th.Tensor, clock_cos: th.Tensor) -> th.Tensor:
+    def _compute_observation(self, command: th.Tensor, clock: th.Tensor) -> th.Tensor:
         linvel = self.linvel.sma
         angvel = self.angvel.sma
         qpos = self.qpos
@@ -183,8 +172,7 @@ class PolicyRunner:
         obs_tensor = th.cat([
             self.obs_hist.buff.view(-1),
             command,
-            clock_sin,
-            clock_cos,
+            clock,
             self.obs_priv,
         ], dim=-1)
         obs_tensor[-3:] = 0.0 # TODO
@@ -192,9 +180,9 @@ class PolicyRunner:
         return obs_tensor
 
 
-    def policy_step(self, command: th.Tensor, clock_sin: th.Tensor, clock_cos: th.Tensor) -> th.Tensor:
+    def policy_step(self, command: th.Tensor, clock: th.Tensor):
         # compute observation tensor
-        obs_tensor = self._compute_observation(command, clock_sin, clock_cos)
+        obs_tensor = self._compute_observation(command, clock)
         obs_tensor.clip_(*self.cfg.obs_clip)
 
         # run onnx session
@@ -204,8 +192,6 @@ class PolicyRunner:
         # compute action tensor
         self.action.copy_(th.from_numpy(session_output[0]).squeeze(0))
         self.action.clip_(*self.cfg.action_clip)
-
-        return self.action * self.q_scale
 
 
     def clear_buff(self):

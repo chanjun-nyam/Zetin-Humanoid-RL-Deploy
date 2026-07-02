@@ -3,13 +3,13 @@ import torch as th
 
 
 def vec_dot(vec1: th.Tensor, vec2: th.Tensor, keepdim: bool = False) -> th.Tensor:
-    """Dot product between two vector.
+    """Dot product between two vectors.
 
     Args:
         vec1 (th.Tensor): vector
         vec2 (th.Tensor): vector
         keepdim (bool, optional):
-            Rather to keep the dimention of resulting vector.
+            Whether to keep the dimension of resulting vector.
             Defaults to False.
 
     Returns:
@@ -19,35 +19,55 @@ def vec_dot(vec1: th.Tensor, vec2: th.Tensor, keepdim: bool = False) -> th.Tenso
 
 
 
-def vec_sq_norm(vec: th.Tensor, keepdim: bool = False) -> th.Tensor:
-    """Squared norm of vector.
+def vec_norm_pow(vec: th.Tensor, p: float = 2.0, keepdim: bool = False) -> th.Tensor:
+    """P-powered p-norm of vector.
 
     Args:
         vec (th.Tensor): vector
+        p (float): p
         keepdim (bool, optional):
-            Rather to keep the dimention of resulting vector.
+            Whether to keep the dimension of resulting vector.
             Defaults to False.
 
     Returns:
         th.Tensor: Resulting vector.
     """
-    return vec_dot(vec, vec, keepdim=keepdim)
+    return vec.abs().pow(p).sum(dim=-1, keepdim=keepdim)
 
 
 
-def vec_norm(vec: th.Tensor, keepdim: bool = False) -> th.Tensor:
+def vec_sq_norm(vec: th.Tensor, keepdim: bool = False) -> th.Tensor:
+    """Squared norm of vector.
+
+    Note: Deprecated. Use `vec_norm_pow` instead.
+
+    Args:
+        vec (th.Tensor): vector
+        keepdim (bool, optional):
+            Whether to keep the dimension of resulting vector.
+            Defaults to False.
+
+    Returns:
+        th.Tensor: Resulting vector.
+    """
+    return vec_norm_pow(vec, p=2.0, keepdim=keepdim)
+
+
+
+def vec_norm(vec: th.Tensor, p: float = 2.0, keepdim: bool = False) -> th.Tensor:
     """Norm of vector.
 
     Args:
         vec (th.Tensor): vector
+        p (float): p
         keepdim (bool, optional):
-            Rather to keep the dimention of resulting vector.
+            Whether to keep the dimension of resulting vector.
             Defaults to False.
 
     Returns:
         th.Tensor: Resulting vector.
     """
-    return vec_sq_norm(vec, keepdim=keepdim).sqrt()
+    return vec_norm_pow(vec, p=p, keepdim=keepdim).pow(1 / p)
 
 
 
@@ -57,7 +77,7 @@ def quat_apply(quat: th.Tensor, vec: th.Tensor) -> th.Tensor:
     Note:
         - Shape of quaternion is (..., 4) and order of elements is (w, x, y, z).
         - Shape of vector is (..., 3) and order of elements is (x, y, z).
-    
+
     Args:
         quat (th.Tensor): quaternion to apply
         vec (th.Tensor): vector
@@ -67,7 +87,7 @@ def quat_apply(quat: th.Tensor, vec: th.Tensor) -> th.Tensor:
     """
     quat_v = quat[...,1:]
     quat_w = quat[...,:1]
-    
+
     uvec = th.cross(quat_v, vec, dim=-1)
     uuvec = th.cross(quat_v, uvec, dim=-1)
 
@@ -106,7 +126,7 @@ def quat_conj(quat: th.Tensor) -> th.Tensor:
 
     Note:
         - Shape of quaternion is (..., 4) and order of elements is (w, x, y, z).
-    
+
     Args:
         quat (th.Tensor): quaternion
 

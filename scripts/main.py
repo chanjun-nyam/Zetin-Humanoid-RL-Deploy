@@ -1,9 +1,9 @@
 from dataclasses import dataclass, MISSING
 from typing import List
-import copy
 import time
+import copy
 
-import torch
+import torch as th
 
 import limxsdk.robot as sdk_robot
 import limxsdk.datatypes as sdk_dtype
@@ -12,14 +12,14 @@ from policy_runner import PolicyRunner, PolicyRunnerCfg
 
 
 
-@dataclass(slots=True)
+@dataclass
 class ControllerCfg:
 
     robot_ip: str = MISSING
 
     loop_freq: int = MISSING
 
-    logging_steps: int = MISSING
+    log_freq: int = MISSING
 
     ref_q_names: List[str] = MISSING
 
@@ -31,45 +31,30 @@ class ControllerCfg:
 
     q_kd: List[float] = MISSING
 
+    zero_cmd_norm: float = MISSING
+
     policy_runner_cfg: PolicyRunnerCfg = MISSING
 
 
 
 class Controller:
-    __slots__ = (
-        'cfg', 'decimation', 'device',
-        'ref_q_names', 'q_names', 'n_qdim',
-        'q_map', 'q_map_inv',
-        'policy_runner',
-        'robot_type', 'robot',
-        '_imu_data', '_robot_state', '_sensor_joy', '_diagnostic_value',
-        '_imu_data_cnt', '_robot_state_cnt', '_sensor_joy_cnt', '_diagnostic_value_cnt',
-        'imu_data_callback', 'robot_state_callback', 'sensor_joy_callback', 'robot_diagnostic_callback',
-    )
-
 
     def __init__(self, cfg: ControllerCfg):
         self.cfg = cfg
+        self.policy_decimation = cfg.policy_runner_cfg.decimation
+        self.log_decimation = cfg.loop_freq // cfg.log_freq
 
-        self.decimation = cfg.policy_runner_cfg.decimation
-        self.device = torch.device(cfg.policy_runner_cfg.device)
+        self.n_qdim = len(cfg.ref_q_names)
 
-        self.ref_q_names = self.cfg.ref_q_names
-        self.q_names = self.cfg.q_names
-        self.n_qdim = len(self.ref_q_names)
-
-        self.q_map = [self.q_names.index(name) for name in self.ref_q_names]
-        self.q_map_inv = [self.ref_q_names.index(name) for name in self.q_names]
-
-        # policy runner
+        # init policy-runner
         self.policy_runner = PolicyRunner(cfg.policy_runner_cfg)
 
-        # limxsdk robot
-        self.robot_type = sdk_robot.RobotType.PointFoot
-        self.robot = sdk_robot.Robot(self.robot_type, is_sim=False)
+        # init limxsdk
+        self.sdk_robot_type = sdk_robot.RobotType.PointFoot
+        self.sdk_robot = sdk_robot.Robot(self.sdk_robot_type, is_sim=False)
 
-        if not self.robot.init(cfg.robot_ip):
-            print(f'[controller-log] robot initialization failed')
+        if not self.sdk_robot.init(cfg.robot_ip):
+            print(f'[limxsdk-lowlevel] robot initialization failed')
             exit()
 
         # buffers for callback
@@ -91,11 +76,10 @@ class Controller:
         # subscribe callbacks
         self._subscribe_callbacks()
 
-        # print metadata
+        # logging metadata
         print(
             f'[limxsdk-lowlevel]\n'
-            f'motor number: {self.robot.getMotorNumber()}\n'
-            f'motor names: {self.robot.getMotorNames()}\n'
+            f'motor number: {self.sdk_robot.getMotorNumber()}\n'
         )
 
 
@@ -121,60 +105,53 @@ class Controller:
             self._diagnostic_value_cnt += 1
         self.robot_diagnostic_callback = robot_diagnostic_callback
 
-        self.robot.subscribeImuData(self.imu_data_callback)
-        self.robot.subscribeRobotState(self.robot_state_callback)
-        self.robot.subscribeSensorJoy(self.sensor_joy_callback)
-        self.robot.subscribeDiagnosticValue(self.robot_diagnostic_callback)
-
-
-    def _apply_q_map(self, q_arr: List[float], inv: bool = False) -> List[float]:
-        return (
-            [q_arr[self.q_map[i]] for i in range(self.n_qdim)]
-            if not inv else
-            [q_arr[self.q_map_inv[i]] for i in range(self.n_qdim)]
-        )
-
-
-    def _float_tensor(self, data):
-        return torch.tensor(data, dtype=torch.float32, device=self.device)
+        self.sdk_robot.subscribeImuData(self.imu_data_callback)
+        self.sdk_robot.subscribeRobotState(self.robot_state_callback)
+        self.sdk_robot.subscribeSensorJoy(self.sensor_joy_callback)
+        self.sdk_robot.subscribeDiagnosticValue(self.robot_diagnostic_callback)
 
 
     def run(self):
-        # logging
         time.sleep(1.0)
-        print(f'[controller-log] main loop start\n')
+        print(f'[limxsdk-lowlevel] run()!!\n')
 
-        # TODO
-        self.robot.setRobotLightEffect(sdk_dtype.LightEffect.STATIC_WHITE)
+        dtype = th.float32
+        device = th.device(self.cfg.policy_runner_cfg.device)
+        def float_tensor(x):
+            return th.tensor(x, dtype=dtype, device=device)
+
+        policy = self.policy_runner
+
+        # preprocess: q-related quantaties
+        to_q_ref = [self.cfg.q_names.index(x) for x in self.cfg.ref_q_names]
+        from_q_ref = [self.cfg.ref_q_names.index(x) for x in self.cfg.q_names]
 
         # buffers
-        qpos_trg = self._float_tensor([0.0] * self.n_qdim)
+        qpos_default = float_tensor(self.cfg.qpos_default)
+        gait_theta = float_tensor([0.0, 0.0])
 
         _robot_cmd = sdk_dtype.RobotCmd()
-        _robot_cmd.mode = [0.0 for _ in range(self.n_qdim)]
-        _robot_cmd.q = [0.0 for _ in range(self.n_qdim)]
-        _robot_cmd.dq = [0.0 for _ in range(self.n_qdim)]
-        _robot_cmd.tau = [0.0 for _ in range(self.n_qdim)]
-        _robot_cmd.Kp = self._apply_q_map(self.cfg.q_kp)
-        _robot_cmd.Kd = self._apply_q_map(self.cfg.q_kd)
-
-        # tensors
-        qpos_default = self._float_tensor(self.cfg.qpos_default)
+        _robot_cmd.mode = [0.0] * self.n_qdim
+        _robot_cmd.q = [0.0] * self.n_qdim
+        _robot_cmd.dq = [0.0] * self.n_qdim
+        _robot_cmd.tau = [0.0] * self.n_qdim
+        _robot_cmd.Kp = [0.0] * self.n_qdim
+        _robot_cmd.Kd = [0.0] * self.n_qdim
 
         # main loop
-        rate = sdk_robot.Rate(self.cfg.loop_freq)
+        sdk_rate = sdk_robot.Rate(self.cfg.loop_freq)
         step_num = 0
 
         step_dt = 0.0
-        sim_dt = 0.0
+        loop_dt = 0.0
         policy_dt = 0.0
         total_dt = 0.0
 
-        is_on = False # TODO
+        # TODO: flags
 
         while True:
-            step_num += 1
             step_ns = time.perf_counter_ns()
+            step_num += 1
 
             # fix data read from callbacks
             imu_data = copy.deepcopy(self._imu_data)
@@ -187,65 +164,91 @@ class Controller:
             sensor_joy_cnt = int(self._sensor_joy_cnt)
             diagnostic_value_cnt = int(self._diagnostic_value_cnt)
 
-            # robot data tensors
-            quat = self._float_tensor(imu_data.quat)
-            angvel = self._float_tensor(imu_data.gyro)
-            qpos = self._float_tensor(self._apply_q_map(robot_state.q, inv=True))
-            qvel = self._float_tensor(self._apply_q_map(robot_state.dq, inv=True))
-            usr_cmd = self._float_tensor([
-                sensor_joy.axes[1], # linear-x
-                sensor_joy.axes[0], # linear-y
-                sensor_joy.axes[2], # angular-z
-            ])
-            is_on = is_on and not (sensor_joy.buttons[1231] == 1)
+            usr_cmd = [
+                sensor_joy.axes[1], # linvel-x
+                sensor_joy.axes[0], # linvel-y
+                sensor_joy.axes[2], # angvel-z
+                1.2, # gait frequency
+                0.5, # gait ratio
+                th.pi, # gait offset
+            ]
+            # TODO
 
-            # simulation step
+            # tensors
+            quat = float_tensor(imu_data.quat)
+            angvel = float_tensor(imu_data.gyro)
+            linvel = th.zeros_like(angvel)
+            qpos = float_tensor(robot_state.q)[from_q_ref]
+            qvel = float_tensor(robot_state.dq)[from_q_ref]
+
+            # gait
+            vel_cmd = float_tensor(usr_cmd[0:3])
+            gait_freq = float_tensor(usr_cmd[3])
+            gait_ratio = float_tensor(usr_cmd[4])
+            gait_offset = float_tensor(usr_cmd[5])
+
+            gait_theta[0].add_((2.0 * th.pi * (1.0 / self.cfg.sim_freq)) * gait_freq)
+            gait_theta[1].copy_(gait_theta[0] + gait_offset)
+            gait_theta.remainder_(2.0 * th.pi)
+
+            # apply zero-cmd
+            is_walk = float_tensor(usr_cmd[0:3]).square().sum(dim=0).sqrt() > self.cfg.zero_cmd_norm
+            vel_cmd *= is_walk
+            gait_freq *= is_walk
+
+            # step policy-runner
             s = time.perf_counter_ns()
-            self.policy_runner.sim_step(quat, angvel, qpos - qpos_default, qvel)
-            sim_dt = (time.perf_counter_ns() - s) / 1e9
+            policy.sim_step(quat, linvel, angvel, qpos - qpos_default, qvel)
+            loop_dt = (time.perf_counter_ns() - s) / 1e9
 
             # policy step
-            if step_num % self.decimation == 0:
+            if step_num % self.policy_decimation == 0:
+                command = th.cat([vel_cmd, th.stack([gait_freq, gait_ratio, gait_offset])], dim=-1)
+                clock = th.cat([gait_theta.sin(), gait_theta.cos()], dim=-1)
+
                 s = time.perf_counter_ns()
-                qpos_trg = self.policy_runner.policy_step(usr_cmd)
+                policy.policy_step(command[0:5], clock * is_walk)
                 policy_dt = (time.perf_counter_ns() - s) / 1e9
 
             # write action to robot
-            if not is_on:
-                _robot_cmd.Kp = [0.0] * len(_robot_cmd.Kp)
-                _robot_cmd.Kd = [0.0] * len(_robot_cmd.Kd)
-            _robot_cmd.q = self._apply_q_map((qpos_default + qpos_trg).tolist())
-            self.robot.publishRobotCmd(_robot_cmd)
+            qpos_trg = qpos_default + policy.action * policy.q_scale
+            _robot_cmd.q = qpos_trg[to_q_ref].tolist()
+            _robot_cmd.Kp = float_tensor(self.cfg.q_kp)[to_q_ref].tolist()
+            _robot_cmd.Kd = float_tensor(self.cfg.q_kd)[to_q_ref].tolist()
+            self.sdk_robot.publishRobotCmd(_robot_cmd)
 
-            if not is_on:
-                self.robot.setRobotLightEffect(sdk_dtype.LightEffect.STATIC_RED)
+            # TODO: robot flag 에 따른
+            self.sdk_robot.setRobotLightEffect(sdk_dtype.LightEffect.STATIC_WHITE)
 
             # logging
-            if step_num % self.cfg.logging_steps == 1:
+            if step_num % self.log_decimation == 0:
                 print(
-                    f'[controller-log]\n'
+                    f'[limxsdk-lowlevel]\n'
                     f'step-num: {step_num}\n'
+
                     f'joy-axes: {" | ".join([f"{x:6.3f}" for x in sensor_joy.axes])}\n'
                     f'joy-buttons: {" | ".join([f"{x}" for x in sensor_joy.buttons])}\n'
                     f'motor-names: {robot_state.motor_names}\n'
 
                     f'total-util: {total_dt * self.cfg.loop_freq:.4f} | '
                     f'step-util: {step_dt * self.cfg.loop_freq:.4f} | '
-                    f'sim-util: {sim_dt * self.cfg.loop_freq:.4f} | '
+                    f'loop-util: {loop_dt * self.cfg.loop_freq:.4f} | '
                     f'policy-util: {policy_dt * self.cfg.loop_freq:.4f}\n'
 
                     f'cnt: {imu_data_cnt} | {robot_state_cnt} | {sensor_joy_cnt} | {diagnostic_value_cnt}\n'
 
                     f'quat: {" | ".join([f"{x:6.3f}" for x in quat])}\n'
+                    f'lvel: {" | ".join([f"{x:6.3f}" for x in linvel])}\n'
                     f'avel: {" | ".join([f"{x:6.3f}" for x in angvel])}\n'
                     f'qpos: {" | ".join([f"{x:6.3f}" for x in qpos])}\n'
                     f'qvel: {" | ".join([f"{x:6.3f}" for x in qvel])}\n'
                     f'qtrg: {" | ".join([f"{x:6.3f}" for x in qpos_trg])}\n'
-                ) # TODO
+                    f'ucmd: {" | ".join([f"{x:6.3f}" for x in usr_cmd])}\n'
+                )
 
             # fix loop delta-time
             step_dt = (time.perf_counter_ns() - step_ns) / 1e9
-            rate.sleep()
+            sdk_rate.sleep()
             total_dt = (time.perf_counter_ns() - step_ns) / 1e9
 
 
@@ -273,21 +276,15 @@ if __name__ == '__main__':
         # robot_ip='10.192.1.2',
 
         loop_freq=LOOP_FREQ,
-        logging_steps=LOOP_FREQ // LOG_FREQ,
+        log_freq=LOG_FREQ,
 
         ref_q_names=SDK_Q_NAMES,
         q_names=USD_Q_NAMES,
+        qpos_default=[0.0] * 8,
+        q_kp=[45., 45., 45., 45., 45., 45., 45., 45.],
+        q_kd=[1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 0.8, 0.8],
 
-        qpos_default=[
-            0.0, 0.0,
-            0.0, 0.0,
-            # 0.13, -0.13, # TODO
-            0.0, 0.0,
-            0.0, 0.0,
-        ],
-
-        q_kp=[45.0] * 8,
-        q_kd=[1.5] * 6 + [0.8] * 2,
+        zero_cmd_norm=0.2,
 
         policy_runner_cfg=PolicyRunnerCfg(
             decimation=LOOP_FREQ // POLICY_FREQ,
@@ -299,9 +296,7 @@ if __name__ == '__main__':
             obs_scale=[0.25, 1.0, 1.0, 0.05, 1.0, 1.0],
             obs_clip=(-100.0, 100.0),
             action_clip=(-100.0, 100.0),
-            # model_path='models/tron1_0_s_rough.onnx',
-            model_path='models/tron1_0_s_flat_.onnx',
-            # model_path='models/tron1_0_s_flat_2.onnx',
+            model_path='models/tron1_s_flat.onnx',
         ),
     )
 
