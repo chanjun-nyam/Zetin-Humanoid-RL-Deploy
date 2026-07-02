@@ -154,7 +154,7 @@ class PolicyRunner:
         self.qvel.update(qvel)
 
 
-    def _compute_observation(self, command: th.Tensor) -> th.Tensor:
+    def _compute_observation(self, command: th.Tensor, clock_sin: th.Tensor, clock_cos: th.Tensor) -> th.Tensor:
         linvel = self.linvel.sma
         angvel = self.angvel.sma
         qpos = self.qpos
@@ -183,6 +183,8 @@ class PolicyRunner:
         obs_tensor = th.cat([
             self.obs_hist.buff.view(-1),
             command,
+            clock_sin,
+            clock_cos,
             self.obs_priv,
         ], dim=-1)
         obs_tensor[-3:] = 0.0 # TODO
@@ -190,9 +192,9 @@ class PolicyRunner:
         return obs_tensor
 
 
-    def policy_step(self, command: th.Tensor) -> th.Tensor:
+    def policy_step(self, command: th.Tensor, clock_sin: th.Tensor, clock_cos: th.Tensor) -> th.Tensor:
         # compute observation tensor
-        obs_tensor = self._compute_observation(command)
+        obs_tensor = self._compute_observation(command, clock_sin, clock_cos)
         obs_tensor.clip_(*self.cfg.obs_clip)
 
         # run onnx session

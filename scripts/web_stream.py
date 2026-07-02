@@ -5,9 +5,10 @@ import os
 os.environ.setdefault('MUJOCO_GL', 'egl')
 
 import io
+import math
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -32,6 +33,26 @@ except ImportError:
         return buf.getvalue()
 
 
+@dataclass
+class SliderCfg:
+    """One command slider. Configure these in WebStreamCfg.sliders."""
+
+    label: str
+
+    min: float
+
+    max: float
+
+    step: float = 0.01
+
+    # initial value. leave as None to default to the midpoint of [min, max].
+    value: float = None
+
+    def __post_init__(self):
+        if self.value is None:
+            self.value = 0.5 * (self.min + self.max)
+        self.value = max(self.min, min(self.max, float(self.value)))
+
 
 @dataclass
 class WebStreamCfg:
@@ -50,6 +71,16 @@ class WebStreamCfg:
 
     stream_freq: int = 50
 
+    # command sliders, in order. edit here to change count / range / label.
+    # get_cmd() returns a list of the same length and order as this list.
+    sliders: list[SliderCfg] = field(default_factory=lambda: [
+        SliderCfg('vx',  -1.5, 1.5),
+        SliderCfg('vy',  -1.0, 1.0),
+        SliderCfg('wz',  -1.0, 1.0),
+        SliderCfg('fq',   0.8, 1.6),
+        SliderCfg('rt',   0.4, 0.6),
+        SliderCfg('of',   0.0, 2 * math.pi),
+    ])
 
 
 INDEX_HTML = """<!doctype html>
@@ -63,7 +94,7 @@ INDEX_HTML = """<!doctype html>
   img { background: #000; border: 1px solid #333; max-width: 100%; }
   .sliders { width: __WIDTH__px; max-width: 100%; display: flex; flex-direction: column; gap: 12px; }
   .row { display: flex; align-items: center; gap: 12px; }
-  .row label { width: 32px; }
+  .row label { width: 40px; }
   .row input { flex: 1; }
   .row span { width: 56px; text-align: right; }
 </style>
@@ -72,14 +103,14 @@ INDEX_HTML = """<!doctype html>
   <div class="wrap">
     <img id="view" src="/stream" width="__WIDTH__" height="__HEIGHT__">
     <div class="sliders">
-      <div class="row"><label>vx</label><input id="s0" type="range" min="-1" max="1" step="0.01" value="0"><span id="v0">0.00</span></div>
-      <div class="row"><label>vy</label><input id="s1" type="range" min="-1" max="1" step="0.01" value="0"><span id="v1">0.00</span></div>
-      <div class="row"><label>wz</label><input id="s2" type="range" min="-1" max="1" step="0.01" value="0"><span id="v2">0.00</span></div>
+__ROWS__
     </div>
   </div>
 <script>
-  const s = [0, 1, 2].map(i => document.getElementById('s' + i));
-  const v = [0, 1, 2].map(i => document.getElementById('v' + i));
+  const N = __N__;
+  const idx = [...Array(N).keys()];
+  const s = idx.map(i => document.getElementById('s' + i));
+  const v = idx.map(i => document.getElementById('v' + i));
   let dirty = true;
   s.forEach((el, i) => el.addEventListener('input', () => {
     v[i].textContent = parseFloat(el.value).toFixed(2);
@@ -88,13 +119,25 @@ INDEX_HTML = """<!doctype html>
   setInterval(() => {
     if (!dirty) return;
     dirty = false;
-    fetch(`/cmd?x=${s[0].value}&y=${s[1].value}&z=${s[2].value}`).catch(() => {});
+    const q = idx.map(i => `s${i}=${s[i].value}`).join('&');
+    fetch(`/cmd?${q}`).catch(() => {});
   }, 50);
 </script>
 </body>
 </html>
 """
 
+
+def _render_slider_rows(sliders):
+    rows = []
+    for i, sl in enumerate(sliders):
+        rows.append(
+            f'      <div class="row"><label>{sl.label}</label>'
+            f'<input id="s{i}" type="range" min="{sl.min}" max="{sl.max}" '
+            f'step="{sl.step}" value="{sl.value}">'
+            f'<span id="v{i}">{sl.value:.2f}</span></div>'
+        )
+    return '\n'.join(rows)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -120,6 +163,8 @@ class _Handler(BaseHTTPRequestHandler):
             INDEX_HTML
             .replace('__WIDTH__', str(app.cfg.width))
             .replace('__HEIGHT__', str(app.cfg.height))
+            .replace('__N__', str(len(app.cfg.sliders)))
+            .replace('__ROWS__', _render_slider_rows(app.cfg.sliders))
             .encode()
         )
         self.send_response(200)
@@ -153,15 +198,15 @@ class _Handler(BaseHTTPRequestHandler):
             pass  # client disconnected
 
     def _serve_cmd(self, app, query):
+        n = len(app.cfg.sliders)
         try:
-            values = [float(query[k][0]) for k in ('x', 'y', 'z')]
+            values = [float(query[f's{i}'][0]) for i in range(n)]
         except (KeyError, IndexError, ValueError):
             self.send_error(400)
             return
         app.set_command(values)
         self.send_response(204)
         self.end_headers()
-
 
 
 class _HTTPServer(ThreadingHTTPServer):
@@ -172,7 +217,6 @@ class _HTTPServer(ThreadingHTTPServer):
     def __init__(self, address, app):
         super().__init__(address, _Handler)
         self.app = app
-
 
 
 class WebStreamServer:
@@ -189,7 +233,8 @@ class WebStreamServer:
         self._jpeg = None
         self._jpeg_lock = threading.Lock()
 
-        self._cmd = [0.0, 0.0, 0.0]
+        # command vector matches cfg.sliders in length and order
+        self._cmd = [sl.value for sl in cfg.sliders]
         self._cmd_lock = threading.Lock()
 
         # http server in a background thread
@@ -223,6 +268,9 @@ class WebStreamServer:
 
     # called from the http handler thread
     def set_command(self, values):
-        clipped = [max(-1.0, min(1.0, float(v))) for v in values]
+        clipped = [
+            max(sl.min, min(sl.max, float(v)))
+            for sl, v in zip(self.cfg.sliders, values)
+        ]
         with self._cmd_lock:
             self._cmd = clipped

@@ -35,8 +35,6 @@ class SimulatorCfg:
 
     q_kd: List[float] = MISSING
 
-    zero_cmd_norm: float = MISSING
-
     policy_runner_cfg: PolicyRunnerCfg = MISSING
 
 
@@ -103,19 +101,10 @@ class Simulator:
         q_kp = float_tensor(self.cfg.q_kp)
         q_kd = float_tensor(self.cfg.q_kd)
 
-        gait_theta = float_tensor([0.0, 0.0])
-
-        usr_cmd = [
-            0.0,
-            0.0,
-            0.0,
-            1.4,
-            0.5,
-            th.pi,
-        ]
+        usr_cmd = float_tensor([0.0, 0.0, 0.0])
 
         from policy_runner.utils import SMABuffer
-        vel_buff = SMABuffer.init_like(float_tensor([0.0] * 3), (0,), self.cfg.sim_freq)
+        vel_buff = SMABuffer.init_like(usr_cmd, (0,), self.cfg.sim_freq)
 
         # main loop
         step_num = 0
@@ -140,21 +129,6 @@ class Simulator:
             qpos = th.from_numpy(mj_data.qpos[7:])[from_q_ref]
             qvel = th.from_numpy(mj_data.qvel[6:])[from_q_ref]
 
-            # gait
-            gait_freq = float_tensor(usr_cmd[3])
-            gait_ratio = float_tensor(usr_cmd[4])
-            gait_offset = float_tensor(usr_cmd[5])
-
-            gait_theta[0].add_((2.0 * th.pi * (1.0 / self.cfg.sim_freq)) * gait_freq)
-            gait_theta[1].copy_(gait_theta[0] + gait_offset)
-            gait_theta.remainder_(2.0 * th.pi)
-
-            # apply zero-cmd
-            is_zero = float_tensor(usr_cmd[0:3]).square().sum(dim=0).sqrt() < self.cfg.zero_cmd_norm
-            is_stand = is_zero
-            is_walk = is_stand.logical_not()
-            gait_freq *= is_walk
-
             vel_buff.update(th.cat([linvel[0:2], angvel[2:3]]))
 
             # step policy-runner
@@ -165,8 +139,7 @@ class Simulator:
             # policy step
             if step_num % self.policy_decimation == 0:
                 s = time.perf_counter_ns()
-                command = float_tensor(usr_cmd[:5])
-                qpos_trg = self.policy_runner.policy_step(command, gait_theta.sin() * is_walk, gait_theta.cos() * is_walk) + qpos_default
+                qpos_trg = self.policy_runner.policy_step(usr_cmd) + qpos_default
                 policy_dt = (time.perf_counter_ns() - s) / 1e9
                 if False:
                     print(
@@ -181,14 +154,48 @@ class Simulator:
                     )
 
             # write action to robot
-            qtau = q_kp * (qpos_trg - qpos) - q_kd * qvel
+            if step_num <= 1000:
+                qpos_trg_ = qpos.clone()
+                init_pos = float_tensor([-0.000, -0.004, 1.0,  -1.0,  1.362, -1.362, -0.452, -0.451])
+                # mj_model.opt.gravity = [0, 0, -0.1]
+            elif step_num > 1000:
+                qpos_trg_ += (init_pos - qpos) * 0.3 * (1 / self.cfg.sim_freq)
+            qtau = q_kp * (qpos_trg_ - qpos) - q_kd * qvel
+            if step_num < 2000:
+                qtau[:] = 0.0
+            if step_num == 1:
+                mj_data.qpos[7:] = init_pos[to_q_ref].numpy()
+                mj_data.qpos[3:7][0] = 0.9239
+                mj_data.qpos[3:7][1] = 0.0
+                mj_data.qpos[3:7][2] = -0.3827
+                mj_data.qpos[3:7][3] = 0.0
+                mj_model.opt.gravity = [0, 0, -0.05]
+
+            if step_num == 1:
+                mj_model.opt.gravity = [0, 0, -0.05]
+                key_id = mj_model.key("home").id
+                mj.mj_resetDataKeyframe(mj_model, mj_data, key_id)
+            if step_num == 4000:
+                mj_model.opt.gravity = [0, 0, -9.8]
+
+            if step_num <= 6000:
+                qtau[:] = 0.0
+                qpos_trg_ = qpos.clone()
+                init_pos = th.zeros_like(qpos)
+                init_pos[2] = 0.13
+                init_pos[3] = -0.13
+            else:
+                qpos_trg_ += (0.0 - qpos) * 0.1 * (1 / 500)
+                # qpos_trg_ = qpos_trg
+                qtau = q_kp * (qpos_trg_ - qpos) - q_kd * qvel
             mj_data.ctrl[:] = qtau[to_q_ref].numpy()
 
             # render-rate hooks: pull user-command, push rendered frame
             if step_num % self.rend_decimation == 0:
                 s = time.perf_counter_ns()
                 if self._cmd_callback is not None:
-                    usr_cmd = self._cmd_callback()
+                    usr_cmd = float_tensor(self._cmd_callback())
+                    usr_cmd[0] *= 1.5 # x-linear velocity 는 max +-1.5m/s
                 if self._render_callback is not None:
                     self._render_callback(mj_model, mj_data)
                 rend_dt = (time.perf_counter_ns() - s) / 1e9
@@ -233,7 +240,7 @@ if __name__ == '__main__':
         'ankle_L_Joint','ankle_R_Joint',
     ]
 
-    SIM_FREQ = 300
+    SIM_FREQ = 500
     POLICY_FREQ = 50
     REND_FREQ = 50
     LOG_FREQ = 10
@@ -256,7 +263,6 @@ if __name__ == '__main__':
         ],
         q_kp=[45., 45., 45., 45., 45., 45., 45., 45.],
         q_kd=[1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 0.8, 0.8],
-        zero_cmd_norm=0.2,
 
         policy_runner_cfg=PolicyRunnerCfg(
             decimation=SIM_FREQ // POLICY_FREQ,
@@ -268,13 +274,16 @@ if __name__ == '__main__':
             obs_scale=[0.25, 1.0, 1.0, 0.05, 1.0, 1.0],
             obs_clip=(-100.0, 100.0),
             action_clip=(-100.0, 100.0),
-            model_path='models/model_4000.onnx',
+            # model_path='models/tron1_0_s_rough.onnx',
+            model_path='models/tron1_0_s_flat_.onnx',
+            # model_path='models/tron1_0_s_flat_2.onnx',
         ),
     )
 
     # build simulator
     simulator = Simulator(simulator_cfg)
 
+    # web stream server: offscreen rendering + 3 user-command sliders,
     # reachable over an ssh-forwarded tcp port (default 8000).
     web_stream = WebStreamServer(
         cfg = WebStreamCfg(
