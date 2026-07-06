@@ -4,8 +4,6 @@ import os
 # 'egl' for headless gpu servers, 'osmesa' for cpu-only. override via env var.
 os.environ.setdefault('MUJOCO_GL', 'egl')
 
-from dataclasses import dataclass, MISSING
-from typing import Callable, Optional
 import time
 
 import mujoco as mj
@@ -20,188 +18,58 @@ from robofsm.bipedal import (
     RLPolicy,
     RLPolicyCfg,
 )
-from web_stream_ import WebStreamServer, WebStreamCfg, SliderCfg
+from web_stream import WebStreamServer, WebStreamCfg, SliderCfg, ToggleCfg
 
 
 
-@dataclass
-class SimulatorCfg:
+REF_Q_NAMES = [
+    'abad_L_Joint', 'hip_L_Joint', 'knee_L_Joint', 'ankle_L_Joint',
+    'abad_R_Joint', 'hip_R_Joint', 'knee_R_Joint', 'ankle_R_Joint',
+]
+RL_Q_NAMES = [
+    'abad_L_Joint', 'abad_R_Joint',
+    'hip_L_Joint',  'hip_R_Joint',
+    'knee_L_Joint', 'knee_R_Joint',
+    'ankle_L_Joint','ankle_R_Joint',
+]
 
-    mjcf_path: str = MISSING
+LOOP_FREQ = 400
+POLICY_FREQ = 50
+REND_FREQ = 50
+LOG_FREQ = 10
 
-    sim_freq: int = MISSING
-
-    rend_freq: int = MISSING
-
-    log_freq: int = MISSING
-
-
-class Simulator:
-
-    def __init__(self, cfg: SimulatorCfg):
-        self.cfg = cfg
-        self.rend_decimation = cfg.sim_freq // cfg.rend_freq
-        self.log_decimation = cfg.sim_freq // cfg.log_freq
-
-        # rendering / user-command hooks (registered via register_* methods below)
-        self._render_callback: Optional[Callable] = None
-        self._cmd_callback: Optional[Callable] = None
-
-        # init mujoco
-        self.mj_model = mj.MjModel.from_xml_path(self.cfg.mjcf_path)
-        self.mj_data = mj.MjData(self.mj_model)
-
-        self.mj_model.opt.timestep = 1.0 / cfg.sim_freq
-
-
-    def register_render_callback(self, callback: Callable):
-        self._render_callback = callback
-
-
-    def register_cmd_callback(self, callback: Callable):
-        self._cmd_callback = callback
-
-
-    def run(self, node: BaseNode[RobotState]):
-        s = node.state
-
-        mj_model = self.mj_model
-        mj_data = self.mj_data
-
-        def tensor(data, dtype=th.float32, device=th.device('cpu')):
-            return th.tensor(data, dtype=dtype, device=device)
-
-        # preprocess: sensor data indices
-        sensor_names = ['quat', 'linvel', 'linacc', 'angvel']
-        sensor_ids = [mj.mj_name2id(mj_model, mj.mjtObj.mjOBJ_SENSOR, x) for x in sensor_names]
-        sensor_slices = [
-            slice(mj_model.sensor_adr[x], mj_model.sensor_adr[x] + mj_model.sensor_dim[x])
-            for x in sensor_ids
-        ]
-        sensor_name2slice = {a: b for a, b in zip(sensor_names, sensor_slices)}
-
-        # buffers
-        usr_cmd = [0.5] * 7
-
-        from robofsm.utils.buffer import SMABuffer
-        vel_buff = SMABuffer.init_like(tensor([0.0] * 3), (0,), self.cfg.sim_freq)
-
-        # main loop
-        step_num = 0
-
-        step_dt = 0.0
-        sim_dt = 0.0
-        rend_dt = 0.0
-        total_dt = 0.0
-
-        while True:
-            step_ns = time.perf_counter_ns()
-            step_num += 1
-
-            # step mujoco simulator
-            mj.mj_step(mj_model, mj_data)
-
-            # tensors
-            s.quat_w = th.from_numpy(mj_data.sensordata[sensor_name2slice['quat']])
-            s.linvel_b = th.from_numpy(mj_data.sensordata[sensor_name2slice['linvel']])
-            s.angvel_b = th.from_numpy(mj_data.sensordata[sensor_name2slice['angvel']])
-            s.qpos = th.from_numpy(mj_data.qpos[7:])
-            s.qvel = th.from_numpy(mj_data.qvel[6:])
-
-            vel_buff.update(th.cat([s.linvel_b[0:2], s.angvel_b[2:3]]))
-
-            # step policy-runner
-            t_ns = time.perf_counter_ns()
-            node = node.update()
-            sim_dt = (time.perf_counter_ns() - t_ns) / 1e9
-
-            # user cmd
-            if isinstance(node, RLPolicyNode):
-                node.set_cmd(tensor(usr_cmd[:6]), tensor(usr_cmd[6] > 0.6, dtype=th.bool))
-
-            # write action to robot
-            qtau = s.kp * (s.qpos_trg - s.qpos) - s.kd * s.qvel
-            mj_data.ctrl[:] = qtau.numpy()
-
-            # render-rate hooks: pull user-command, push rendered frame
-            if step_num % self.rend_decimation == 0:
-                t_ns = time.perf_counter_ns()
-                if self._cmd_callback is not None:
-                    usr_cmd = self._cmd_callback()
-                if self._render_callback is not None:
-                    self._render_callback(mj_model, mj_data)
-                rend_dt = (time.perf_counter_ns() - t_ns) / 1e9
-
-            # logging
-            if step_num % self.log_decimation == 0:
-                print(
-                    f'[simulator]\n'
-                    f'step-num: {step_num}\n'
-
-                    f'total-util: {total_dt * self.cfg.sim_freq:.4f} | '
-                    f'step-util: {step_dt * self.cfg.sim_freq:.4f} | '
-                    f'sim-util: {sim_dt * self.cfg.sim_freq:.4f} | '
-                    f'rend-util: {rend_dt * self.cfg.sim_freq:.4f}\n'
-
-                    f'quat: {" | ".join([f"{x:6.3f}" for x in s.quat_w])}\n'
-                    f'lvel: {" | ".join([f"{x:6.3f}" for x in s.linvel_b])}\n'
-                    f'avel: {" | ".join([f"{x:6.3f}" for x in s.angvel_b])}\n'
-                    f'avgv: {" | ".join([f"{x:6.3f}" for x in vel_buff.sma])}\n'
-                    f'qpos: {" | ".join([f"{x:6.3f}" for x in s.qpos])}\n'
-                    f'qvel: {" | ".join([f"{x:6.3f}" for x in s.qvel])}\n'
-                    f'qtrg: {" | ".join([f"{x:6.3f}" for x in s.qpos_trg])}\n'
-                    f'qtau: {" | ".join([f"{x:6.3f}" for x in qtau])}\n'
-                    f'ucmd: {" | ".join([f"{x:6.3f}" for x in usr_cmd])}\n'
-                )
-
-            # fix loop delta-time
-            step_dt = (time.perf_counter_ns() - step_ns) / 1e9
-            while ((time.perf_counter_ns() - step_ns) / 1e9) * self.cfg.sim_freq < 1.0:
-                pass
-            total_dt = (time.perf_counter_ns() - step_ns) / 1e9
+MJCF_PATH = 'assets/Tron1-S/robot.xml'
 
 
 
-if __name__ == '__main__':
-    # q-names
-    REF_Q_NAMES = [
-        'abad_L_Joint', 'hip_L_Joint', 'knee_L_Joint', 'ankle_L_Joint',
-        'abad_R_Joint', 'hip_R_Joint', 'knee_R_Joint', 'ankle_R_Joint',
-    ]
-    RL_Q_NAMES = [
-        'abad_L_Joint', 'abad_R_Joint',
-        'hip_L_Joint',  'hip_R_Joint',
-        'knee_L_Joint', 'knee_R_Joint',
-        'ankle_L_Joint','ankle_R_Joint',
-    ]
-
-    SIM_FREQ = 400
-    POLICY_FREQ = 50
-    REND_FREQ = 50
-    LOG_FREQ = 10
-
-    # build fsm graph
+def build_robofsm_graph():
+    # build: robot-state
     def tensor(data, dtype=th.float32, device=th.device('cpu')):
         return th.tensor(data, dtype=dtype, device=device)
 
     robot_state = RobotState(
-        n_qdim=8,
+        n_qdim=len(REF_Q_NAMES),
         q_names=REF_Q_NAMES,
+
         quat_w=tensor([1, 0, 0, 0]),
         linvel_b=tensor([0, 0, 0]),
         angvel_b=tensor([0, 0, 0]),
+
         qpos=tensor([0] * 8),
         qvel=tensor([0] * 8),
         qpos_trg=tensor([0] * 8),
+
         kp=tensor([0] * 8),
         kd=tensor([0] * 8),
+
         qpos_def=tensor([0] * 8),
-        kp_def=tensor([45] * 8),
-        kd_def=tensor([1.5] * 6 + [0.8] * 2),
+        kp_def=tensor([45., 45., 45., 45., 45., 45., 45., 45.]),
+        kd_def=tensor([1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 0.8, 0.8]),
     )
 
+    # build: rl-policy
     rl_policy = RLPolicy(RLPolicyCfg(
-        step_freq=SIM_FREQ,
+        step_freq=LOOP_FREQ,
         policy_freq=POLICY_FREQ,
         device='cpu',
         q_names=RL_Q_NAMES,
@@ -211,38 +79,206 @@ if __name__ == '__main__':
         action_scale=[0.5] * 8,
         obs_clip=(-100.0, 100.0),
         action_clip=(-100.0, 100.0),
-        vel_cmd_rng=[
-            (-1.5, 1.5),
-            (-1.0, 1.0),
-            (-1.0, 1.0),
-        ],
-        gait_cmd_rng=[
-            (0.8, 1.6),
-            (0.4, 0.6),
-            (th.pi/2, th.pi/2),
+        cmd_rng=[
+            (-1.5, 1.5), # linvel-x
+            (-1.0, 1.0), # linvel-y
+            (-1.0, 1.0), # angvel-z
+            (0.8, 1.6), # gait freq
+            (0.4, 0.6), # gait ratio
+            (th.pi/2, th.pi/2), # gait offset
         ],
         # model_path='models/tron1_s_flat.onnx',
         model_path='models/tron1_s_rough.onnx',
     ))
 
+    # build: fsm nodes
     hard_stop_node = HardStopNode(robot_state)
-    soft_stop_node = SoftStopNode(robot_state, duration=5.0)
-    rl_policy_node = RLPolicyNode(robot_state, rl_policy=rl_policy, duration=0.000001)
+    soft_stop_node = SoftStopNode(robot_state, duration=3.0)
+    rl_policy_node = RLPolicyNode(robot_state, rl_policy=rl_policy, duration=1e-6)
 
-    # configure edge
-    # hard_stop_node.add_edge()
+    # edge triggers
+    axes = {
+        'linvel-x': 0.5,
+        'linvel-y': 0.5,
+        'angvel-z': 0.5,
+        'gait-freq': 0.5,
+        'gait-ratio': 0.5,
+        'gait-offset': 0.5,
+    }
+    btns = {
+        'hard-stop': False,
+        'soft-stop': False,
+        'rl-run': False,
+    }
+    cmd = (axes, btns)
 
-    # controller configuration
-    simulator_cfg = SimulatorCfg(
-        mjcf_path='assets/Tron1-S/robot.xml',
-        sim_freq=SIM_FREQ,
-        rend_freq=REND_FREQ,
-        log_freq=LOG_FREQ,
+    rl_cmd = (
+        th.tensor([0.5] * 6, dtype=th.float32, device='cpu'),
+        th.tensor([False], dtype=th.bool, device='cpu'),
+    )
+    rl_policy_node.register_cmd(*rl_cmd)
+
+    # build: fsm edges
+    hard_stop_node.add_edge(
+        id='soft-stop', ord=0, next=soft_stop_node,
+        fn=lambda: btns['soft-stop'] and hard_stop_node.t > 1.0,
     )
 
-    # build simulator
-    simulator = Simulator(simulator_cfg)
+    soft_stop_node.add_edge(
+        id='emergency hard-stop', ord=0, next=hard_stop_node,
+        fn=lambda: btns['hard-stop'],
+    )
+    soft_stop_node.add_edge(
+        id='run rl-policy', ord=1, next=rl_policy_node,
+        fn=lambda: btns['rl-run'] and soft_stop_node.t > 5.0,
+    )
 
+    rl_policy_node.add_edge(
+        id='emergency hard-stop', ord=0, next=hard_stop_node,
+        fn=lambda: btns['hard-stop'],
+    )
+    rl_policy_node.add_edge(
+        id='emergency soft-stop', ord=1, next=soft_stop_node,
+        fn=lambda: btns['soft-stop'],
+    )
+
+    return hard_stop_node, cmd, rl_cmd
+
+
+
+def run_robofsm_graph(
+        root_node: BaseNode[RobotState],
+        cmd: tuple[dict, dict],
+        rl_cmd: tuple[th.Tensor, th.Tensor],
+        _axes_callback,
+        _btns_callback,
+        _render_callback,
+    ):
+    node = root_node
+    s = node.state
+
+    cmd_axes, cmd_btns = cmd
+    rl_cmd_axes, rl_cmd_btns = rl_cmd
+
+    rend_decimation = LOOP_FREQ // REND_FREQ
+    log_decimation = LOOP_FREQ // LOG_FREQ
+
+    # init mujoco
+    mj_model = mj.MjModel.from_xml_path(MJCF_PATH)
+    mj_model.opt.timestep = 1.0 / LOOP_FREQ
+    mj_data = mj.MjData(mj_model)
+
+    # preprocess: sensor data indices
+    sensor_names = ['quat', 'linvel', 'linacc', 'angvel']
+    sensor_ids = [mj.mj_name2id(mj_model, mj.mjtObj.mjOBJ_SENSOR, x) for x in sensor_names]
+    sensor_slices = [
+        slice(mj_model.sensor_adr[x], mj_model.sensor_adr[x] + mj_model.sensor_dim[x])
+        for x in sensor_ids
+    ]
+    sensor_name2slice = {a: b for a, b in zip(sensor_names, sensor_slices)}
+
+    # main loop
+    step_num = 0
+
+    step_dt = 0.0
+    sim_dt = 0.0
+    rend_dt = 0.0
+    total_dt = 0.0
+
+    usr_axes = [0.5] * 6
+    usr_btns = [False] * 4
+
+    while True:
+        step_ns = time.perf_counter_ns()
+        step_num += 1
+
+        if usr_btns[3]:
+            mj_data = mj.MjData(mj_model)
+        # step mujoco simulator
+        mj.mj_step(mj_model, mj_data)
+
+        # tensors
+        s.quat_w = th.from_numpy(mj_data.sensordata[sensor_name2slice['quat']])
+        s.linvel_b = th.from_numpy(mj_data.sensordata[sensor_name2slice['linvel']])
+        s.angvel_b = th.from_numpy(mj_data.sensordata[sensor_name2slice['angvel']])
+        s.qpos = th.from_numpy(mj_data.qpos[7:])
+        s.qvel = th.from_numpy(mj_data.qvel[6:])
+
+        # command
+        cmd_axes = {
+            'linvel-x': 0.5,
+            'linvel-y': 0.5,
+            'angvel-z': 0.5,
+            'gait-freq': 0.5,
+            'gait-ratio': 0.5,
+            'gait-offset': 0.5,
+        }
+        cmd_axes['linvel-x'] = usr_axes[0]
+        cmd_axes['linvel-y'] = usr_axes[1]
+        cmd_axes['angvel-z'] = usr_axes[2]
+        cmd_axes['gait-freq'] = usr_axes[3]
+        cmd_axes['gait-ratio'] = usr_axes[4]
+        cmd_axes['gait-offset'] = usr_axes[5]
+        cmd_btns['hard-stop'] = usr_btns[0]
+        cmd_btns['soft-stop'] = usr_btns[1]
+        cmd_btns['rl-run'] = usr_btns[2]
+
+        rl_cmd_axes[0] = cmd_axes['linvel-x']
+        rl_cmd_axes[1] = cmd_axes['linvel-y']
+        rl_cmd_axes[2] = cmd_axes['angvel-z']
+        rl_cmd_axes[3] = cmd_axes['gait-freq']
+        rl_cmd_axes[4] = cmd_axes['gait-ratio']
+        rl_cmd_axes[5] = cmd_axes['gait-offset']
+        rl_cmd_btns[0] = (rl_cmd_axes[0:3] - 0.5).square().sum().sqrt() > 0.1
+
+        # step policy-runner
+        t_ns = time.perf_counter_ns()
+        node = node.update()
+        sim_dt = (time.perf_counter_ns() - t_ns) / 1e9
+
+        # write action to robot
+        qtau = s.kp * (s.qpos_trg - s.qpos) - s.kd * s.qvel
+        mj_data.ctrl[:] = qtau.numpy()
+
+        # render-rate hooks: pull user-command, push rendered frame
+        if step_num % rend_decimation == 0:
+            t_ns = time.perf_counter_ns()
+            usr_axes = _axes_callback()
+            usr_btns = _btns_callback()
+            _render_callback(mj_model, mj_data)
+            rend_dt = (time.perf_counter_ns() - t_ns) / 1e9
+
+        # logging
+        if step_num % log_decimation == 0:
+            print(
+                f'[{__name__}]\n'
+                f'step-num: {step_num}\n'
+
+                f'total-util: {total_dt * LOOP_FREQ:.4f} | '
+                f'step-util: {step_dt * LOOP_FREQ:.4f} | '
+                f'sim-util: {sim_dt * LOOP_FREQ:.4f} | '
+                f'rend-util: {rend_dt * LOOP_FREQ:.4f}\n'
+
+                f'quat: {" | ".join([f"{x:6.3f}" for x in s.quat_w])}\n'
+                f'lvel: {" | ".join([f"{x:6.3f}" for x in s.linvel_b])}\n'
+                f'avel: {" | ".join([f"{x:6.3f}" for x in s.angvel_b])}\n'
+                f'qpos: {" | ".join([f"{x:6.3f}" for x in s.qpos])}\n'
+                f'qvel: {" | ".join([f"{x:6.3f}" for x in s.qvel])}\n'
+                f'qtrg: {" | ".join([f"{x:6.3f}" for x in s.qpos_trg])}\n'
+                f'qtau: {" | ".join([f"{x:6.3f}" for x in qtau])}\n'
+                f'axes: {" | ".join([f"{x:6.3f}" for x in cmd_axes.values()])}\n'
+                f'btns: {" | ".join([f"{x:6.3f}" for x in cmd_btns.values()])}\n'
+            )
+
+        # fix loop delta-time
+        step_dt = (time.perf_counter_ns() - step_ns) / 1e9
+        while ((time.perf_counter_ns() - step_ns) / 1e9) * LOOP_FREQ < 1.0:
+            pass
+        total_dt = (time.perf_counter_ns() - step_ns) / 1e9
+
+
+
+if __name__ == '__main__':
     # reachable over an ssh-forwarded tcp port (default 8000).
     web_stream = WebStreamServer(
         cfg = WebStreamCfg(
@@ -254,22 +290,25 @@ if __name__ == '__main__':
             jpeg_quality=80,
             stream_freq=REND_FREQ,
             sliders=[
-                SliderCfg('vx', 0.0, 1.0),
-                SliderCfg('vy', 0.0, 1.0),
-                SliderCfg('wz', 0.0, 1.0),
-                SliderCfg('fq', 0.0, 1.0),
-                SliderCfg('rt', 0.0, 1.0),
-                SliderCfg('of', 0.0, 1.0),
-                SliderCfg('iw', 0.0, 1.0),
+                SliderCfg('linvel-x', 0.0, 1.0),
+                SliderCfg('linvel-y', 0.0, 1.0),
+                SliderCfg('angvel-z', 0.0, 1.0),
+                SliderCfg('gait-freq', 0.0, 1.0),
+                SliderCfg('gait-ratio', 0.0, 1.0),
+                SliderCfg('gait-offset', 0.0, 1.0),
+            ],
+            toggles=[
+                ToggleCfg('hard-stop'),
+                ToggleCfg('soft-stop'),
+                ToggleCfg('rl-run'),
+                ToggleCfg('reset-sim'),
             ]
         )
     )
 
-    # register rendering + user-command as callbacks on the simulator
-    simulator.register_render_callback(web_stream.render_frame)
-    simulator.register_cmd_callback(web_stream.get_cmd)
-
-    # run controller
-    # simulator.run(hard_stop_node)
-    # simulator.run(soft_stop_node)
-    simulator.run(rl_policy_node)
+    run_robofsm_graph(
+        *build_robofsm_graph(),
+        web_stream.get_cmd,
+        web_stream.get_toggles,
+        web_stream.render_frame,
+    )

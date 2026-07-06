@@ -8,28 +8,39 @@ from .rl_policy import RLPolicy
 
 
 
-class HardStopNode(BaseNode[RobotState]):
+class _TimerNode(BaseNode[RobotState]):
     def __init__(self, state: RobotState):
         super().__init__(state)
 
     def on_enter(self):
-        pass
+        self.t = time.perf_counter()
+
+    def on_update(self):
+        new_t = time.perf_counter()
+        self.dt = new_t - self.t
+        self.t = new_t
+
+
+
+class HardStopNode(_TimerNode):
+    def __init__(self, state: RobotState):
+        super().__init__(state)
 
     def on_update(self):
         self.state.kp.zero_()
         self.state.kd.zero_()
 
-    def on_exit(self):
-        pass
 
 
-
-class SoftStopNode(BaseNode[RobotState]):
+class SoftStopNode(_TimerNode):
     def __init__(self, state: RobotState, duration: float):
         super().__init__(state)
         self.duration = duration
 
     def on_enter(self):
+        super().on_enter()
+        self.r = 0.0
+
         # capture robot state
         s = self.state
         self.qpos_cap = s.qpos.clone()
@@ -37,35 +48,21 @@ class SoftStopNode(BaseNode[RobotState]):
         s.kp.copy_(s.kp_def)
         s.kd.copy_(s.kd_def)
 
-        # reset timer
-        self.frame_t = time.perf_counter()
-        self.t = 0.0
-
     def on_update(self):
-        # update timer
-        new_frame_t = time.perf_counter()
-        dt = new_frame_t - self.frame_t
-        self.frame_t = new_frame_t
-        self.t += dt
+        super().on_update()
+        self.r = min(self.r + self.dt / self.duration, 1.0)
 
         # set qpos target
         s = self.state
-        r = min(self.t / self.duration, 1.0)
-        s.qpos_trg.copy_((1.0 - r) * self.qpos_cap + r * s.qpos_def)
-
-    def on_exit(self):
-        pass
+        s.qpos_trg.copy_((1.0 - self.r) * self.qpos_cap + self.r * s.qpos_def)
 
 
 
-class RLPolicyNode(BaseNode[RobotState]):
+class RLPolicyNode(_TimerNode):
     def __init__(self, state: RobotState, rl_policy: RLPolicy, duration: float):
         super().__init__(state)
         self.rl_policy = rl_policy
         self.duration = duration
-
-        self.usr_cmd = th.tensor([0.5] * 6, dtype=th.float32, device=self.rl_policy.cfg.device)
-        self.is_walk = th.tensor(False, dtype=th.float32, device=self.rl_policy.cfg.device)
 
         # preprocess: q-variables indices mapping
         rl_q_names = self.rl_policy.cfg.q_names
@@ -73,31 +70,27 @@ class RLPolicyNode(BaseNode[RobotState]):
         self.to_q_ref = [rl_q_names.index(x) for x in ref_q_names]
         self.from_q_ref = [ref_q_names.index(x) for x in rl_q_names]
 
-    def set_cmd(self, usr_cmd: th.Tensor, is_walk: th.Tensor):
-        self.usr_cmd.copy_(usr_cmd)
-        self.is_walk.copy_(is_walk)
+    def register_cmd(self, axes: th.Tensor, btns: th.Tensor):
+        self.cmd_axes = axes
+        self.cmd_btns = btns
 
     def on_enter(self):
+        super().on_enter()
+        self.r = 0.0
+
         # capture robot state
         s = self.state
         self.qpos_cap = s.qpos.clone()
-        s.qpos_trg.copy_(s.qpos_def)
+        s.qpos_trg.copy_(s.qpos)
         s.kp.copy_(s.kp_def)
         s.kd.copy_(s.kd_def)
-
-        # reset timer
-        self.frame_t = time.perf_counter()
-        self.t = 0.0
 
         # reset rl policy
         self.rl_policy.reset()
 
     def on_update(self):
-        # update timer
-        new_frame_t = time.perf_counter()
-        dt = new_frame_t - self.frame_t
-        self.frame_t = new_frame_t
-        self.t += dt
+        super().on_update()
+        self.r = min(self.r + self.dt / self.duration, 1.0)
 
         # compute qpos target: run rl-policy
         s = self.state
@@ -107,13 +100,9 @@ class RLPolicyNode(BaseNode[RobotState]):
             angvel=s.angvel_b,
             qpos=s.qpos[self.from_q_ref],
             qvel=s.qvel[self.from_q_ref],
-            is_walk=self.is_walk,
-            usr_cmd=self.usr_cmd,
+            cmd_axes=self.cmd_axes,
+            cmd_btns=self.cmd_btns,
         )[self.to_q_ref]
 
         # set qpos target
-        r = min(self.t / self.duration, 1.0)
-        s.qpos_trg.copy_((1.0 - r) * self.qpos_cap + r * qpos_trg)
-
-    def on_exit(self):
-        pass
+        s.qpos_trg.copy_((1.0 - self.r) * self.qpos_cap + self.r * qpos_trg)

@@ -55,6 +55,22 @@ class SliderCfg:
 
 
 @dataclass
+class ToggleCfg:
+    """One boolean (True/False) button. Configure these in WebStreamCfg.toggles.
+
+    get_toggles() returns a list of bool with the same length and order as this list.
+    """
+
+    label: str
+
+    # initial state
+    value: bool = False
+
+    def __post_init__(self):
+        self.value = bool(self.value)
+
+
+@dataclass
 class WebStreamCfg:
 
     host: str = '0.0.0.0'
@@ -82,6 +98,13 @@ class WebStreamCfg:
         SliderCfg('of',   0.0, 2 * math.pi),
     ])
 
+    # boolean toggle buttons, in order. edit here to change count / label / default.
+    # get_toggles() returns a list of bool of the same length and order as this list.
+    toggles: list[ToggleCfg] = field(default_factory=lambda: [
+        ToggleCfg('en', True),
+        ToggleCfg('rec', False),
+    ])
+
 
 INDEX_HTML = """<!doctype html>
 <html>
@@ -90,49 +113,57 @@ INDEX_HTML = """<!doctype html>
 <title>sim-stream</title>
 <style>
   body { margin: 0; padding: 16px; background: #111; color: #eee; font-family: monospace; }
-  .wrap { display: flex; flex-direction: column; align-items: center; gap: 16px; }
+  .wrap { display: flex; flex-direction: row; align-items: flex-start;
+          justify-content: center; gap: 24px; flex-wrap: wrap; }
   img { background: #000; border: 1px solid #333; max-width: 100%; }
-  .sliders { width: __WIDTH__px; max-width: 100%; display: flex; flex-direction: column; gap: 12px; }
+  .sliders { width: 320px; max-width: 100%; display: flex; flex-direction: column; gap: 12px; }
   .row { display: flex; align-items: center; gap: 12px; }
   .row label { width: 40px; }
   .row input { flex: 1; }
   .row span { width: 56px; text-align: right; }
-  .btns { width: __WIDTH__px; max-width: 100%; display: flex; gap: 12px; }
-  button { flex: 1; padding: 10px; background: #222; color: #eee; border: 1px solid #444;
-           font-family: monospace; font-size: 14px; cursor: pointer; }
-  button:hover { background: #333; }
-  button:active { background: #555; }
+  .row button.toggle { flex: 1; padding: 6px 0; background: #222; color: #eee;
+                       border: 1px solid #444; border-radius: 4px; cursor: pointer;
+                       font-family: monospace; font-size: 13px; }
+  .row button.toggle.on { background: #2a6; color: #000; border-color: #2a6; }
 </style>
 </head>
 <body>
   <div class="wrap">
     <img id="view" src="/stream" width="__WIDTH__" height="__HEIGHT__">
-    <div class="btns">
-      <button id="reset">reset</button>
-    </div>
     <div class="sliders">
 __ROWS__
+__TOGGLE_ROWS__
     </div>
   </div>
 <script>
   const N = __N__;
+  const M = __M__;
   const idx = [...Array(N).keys()];
+  const tdx = [...Array(M).keys()];
   const s = idx.map(i => document.getElementById('s' + i));
   const v = idx.map(i => document.getElementById('v' + i));
+  const t = tdx.map(i => document.getElementById('t' + i));
+  const tState = tdx.map(i => t[i].dataset.on === '1');
   let dirty = true;
   s.forEach((el, i) => el.addEventListener('input', () => {
     v[i].textContent = parseFloat(el.value).toFixed(2);
     dirty = true;
   }));
+  t.forEach((el, i) => el.addEventListener('click', () => {
+    tState[i] = !tState[i];
+    el.dataset.on = tState[i] ? '1' : '0';
+    el.textContent = tState[i] ? 'True' : 'False';
+    el.classList.toggle('on', tState[i]);
+    dirty = true;
+  }));
   setInterval(() => {
     if (!dirty) return;
     dirty = false;
-    const q = idx.map(i => `s${i}=${s[i].value}`).join('&');
+    const q = idx.map(i => `s${i}=${s[i].value}`)
+      .concat(tdx.map(i => `t${i}=${tState[i] ? 1 : 0}`))
+      .join('&');
     fetch(`/cmd?${q}`).catch(() => {});
   }, 50);
-  document.getElementById('reset').addEventListener('click', () => {
-    fetch('/reset').catch(() => {});
-  });
 </script>
 </body>
 </html>
@@ -147,6 +178,19 @@ def _render_slider_rows(sliders):
             f'<input id="s{i}" type="range" min="{sl.min}" max="{sl.max}" '
             f'step="{sl.step}" value="{sl.value}">'
             f'<span id="v{i}">{sl.value:.2f}</span></div>'
+        )
+    return '\n'.join(rows)
+
+
+def _render_toggle_rows(toggles):
+    rows = []
+    for i, tg in enumerate(toggles):
+        on = '1' if tg.value else '0'
+        text = 'True' if tg.value else 'False'
+        cls = 'toggle on' if tg.value else 'toggle'
+        rows.append(
+            f'      <div class="row"><label>{tg.label}</label>'
+            f'<button id="t{i}" class="{cls}" data-on="{on}">{text}</button></div>'
         )
     return '\n'.join(rows)
 
@@ -166,8 +210,6 @@ class _Handler(BaseHTTPRequestHandler):
             self._serve_stream(app)
         elif parsed.path == '/cmd':
             self._serve_cmd(app, parse_qs(parsed.query))
-        elif parsed.path == '/reset':
-            self._serve_reset(app)
         else:
             self.send_error(404)
 
@@ -177,7 +219,9 @@ class _Handler(BaseHTTPRequestHandler):
             .replace('__WIDTH__', str(app.cfg.width))
             .replace('__HEIGHT__', str(app.cfg.height))
             .replace('__N__', str(len(app.cfg.sliders)))
+            .replace('__M__', str(len(app.cfg.toggles)))
             .replace('__ROWS__', _render_slider_rows(app.cfg.sliders))
+            .replace('__TOGGLE_ROWS__', _render_toggle_rows(app.cfg.toggles))
             .encode()
         )
         self.send_response(200)
@@ -212,17 +256,15 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _serve_cmd(self, app, query):
         n = len(app.cfg.sliders)
+        m = len(app.cfg.toggles)
         try:
             values = [float(query[f's{i}'][0]) for i in range(n)]
+            toggles = [query[f't{i}'][0] == '1' for i in range(m)]
         except (KeyError, IndexError, ValueError):
             self.send_error(400)
             return
         app.set_command(values)
-        self.send_response(204)
-        self.end_headers()
-
-    def _serve_reset(self, app):
-        app.request_reset()
+        app.set_toggles(toggles)
         self.send_response(204)
         self.end_headers()
 
@@ -255,10 +297,9 @@ class WebStreamServer:
         self._cmd = [sl.value for sl in cfg.sliders]
         self._cmd_lock = threading.Lock()
 
-        # one-shot reset request, raised by the /reset endpoint and consumed
-        # by the simulation loop via consume_reset().
-        self._reset_flag = False
-        self._reset_lock = threading.Lock()
+        # toggle vector (bool) matches cfg.toggles in length and order
+        self._toggles = [tg.value for tg in cfg.toggles]
+        self._toggle_lock = threading.Lock()
 
         # http server in a background thread
         self._httpd = _HTTPServer((cfg.host, cfg.port), self)
@@ -283,6 +324,12 @@ class WebStreamServer:
             return list(self._cmd)
 
 
+    # bool states, same length and order as cfg.toggles
+    def get_toggles(self):
+        with self._toggle_lock:
+            return list(self._toggles)
+
+
     # called from the http handler thread
     def get_latest_jpeg(self):
         with self._jpeg_lock:
@@ -299,15 +346,7 @@ class WebStreamServer:
             self._cmd = clipped
 
 
-    # called from the http handler thread (/reset button)
-    def request_reset(self):
-        with self._reset_lock:
-            self._reset_flag = True
-
-
-    # called from the simulation loop; returns True once per reset request.
-    def consume_reset(self):
-        with self._reset_lock:
-            flag = self._reset_flag
-            self._reset_flag = False
-        return flag
+    # called from the http handler thread
+    def set_toggles(self, values):
+        with self._toggle_lock:
+            self._toggles = [bool(v) for v in values]

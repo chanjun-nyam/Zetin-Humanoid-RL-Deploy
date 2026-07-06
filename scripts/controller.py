@@ -1,9 +1,7 @@
-from dataclasses import dataclass, MISSING
-from typing import List
 import time
 import copy
 
-import numpy as np
+import torch as th
 
 import limxsdk.robot as sdk_robot
 import limxsdk.datatypes as sdk_dtype
@@ -19,223 +17,50 @@ from robofsm.bipedal import (
 )
 
 
-@dataclass
-class ControllerCfg:
 
-    robot_ip: str = MISSING
+REF_Q_NAMES = [
+    'abad_L_Joint', 'hip_L_Joint', 'knee_L_Joint', 'ankle_L_Joint',
+    'abad_R_Joint', 'hip_R_Joint', 'knee_R_Joint', 'ankle_R_Joint',
+]
+RL_Q_NAMES = [
+    'abad_L_Joint', 'abad_R_Joint',
+    'hip_L_Joint',  'hip_R_Joint',
+    'knee_L_Joint', 'knee_R_Joint',
+    'ankle_L_Joint','ankle_R_Joint',
+]
 
-    loop_freq: int = MISSING
-
-    log_freq: int = MISSING
-
-
-class Controller:
-
-    def __init__(self, cfg: ControllerCfg):
-        self.cfg = cfg
-        self.log_decimation = cfg.loop_freq // cfg.log_freq
-
-        # init limxsdk
-        self.sdk_robot_type = sdk_robot.RobotType.PointFoot
-        self.sdk_robot = sdk_robot.Robot(self.sdk_robot_type, is_sim=False)
-
-        if not self.sdk_robot.init(cfg.robot_ip):
-            print(f'[limxsdk-lowlevel] robot initialization failed')
-            exit()
-
-        # buffers for callback
-        self._imu_data = sdk_dtype.ImuData()
-        self._robot_state = sdk_dtype.RobotState()
-        self._sensor_joy = sdk_dtype.SensorJoy()
-        self._diagnostic_value = sdk_dtype.DiagnosticValue()
-
-        self._imu_data.quat = [1.0, 0.0, 0.0, 0.0]
-        self._robot_state.q = [0.0] * 8
-        self._robot_state.dq = [0.0] * 8
-        self._sensor_joy.axes = [0.0, 0.0, 0.0]
-
-        self._imu_data_cnt = 0
-        self._robot_state_cnt = 0
-        self._sensor_joy_cnt = 0
-        self._diagnostic_value_cnt = 0
-
-        # subscribe callbacks
-        self._subscribe_callbacks()
-
-        # logging metadata
-        print(
-            f'[limxsdk-lowlevel]\n'
-            f'motor number: {self.sdk_robot.getMotorNumber()}\n'
-        )
-
-    def _subscribe_callbacks(self):
-
-        def imu_data_callback(imu_data: sdk_dtype.ImuData):
-            self._imu_data = imu_data
-            self._imu_data_cnt += 1
-        self.imu_data_callback = imu_data_callback
-
-        def robot_state_callback(robot_state: sdk_dtype.RobotState):
-            self._robot_state = robot_state
-            self._robot_state_cnt += 1
-        self.robot_state_callback = robot_state_callback
-
-        def sensor_joy_callback(sensor_joy: sdk_dtype.SensorJoy):
-            self._sensor_joy = sensor_joy
-            self._sensor_joy_cnt += 1
-        self.sensor_joy_callback = sensor_joy_callback
-
-        def robot_diagnostic_callback(diagnostic_value: sdk_dtype.DiagnosticValue):
-            self._diagnostic_value = diagnostic_value
-            self._diagnostic_value_cnt += 1
-        self.robot_diagnostic_callback = robot_diagnostic_callback
-
-        self.sdk_robot.subscribeImuData(self.imu_data_callback)
-        self.sdk_robot.subscribeRobotState(self.robot_state_callback)
-        self.sdk_robot.subscribeSensorJoy(self.sensor_joy_callback)
-        self.sdk_robot.subscribeDiagnosticValue(self.robot_diagnostic_callback)
-
-    def run(self, node: BaseNode[RobotState]):
-        s = node.state
-
-        time.sleep(1.0)
-        print(f'[limxsdk-lowlevel] run()!!\n')
-
-        def array(data, dtype=np.float32):
-            return np.array(data, dtype=dtype)
-
-        # buffers
-        _robot_cmd = sdk_dtype.RobotCmd()
-        _robot_cmd.mode = [0.0] * 8
-        _robot_cmd.q = [0.0] * 8
-        _robot_cmd.dq = [0.0] * 8
-        _robot_cmd.tau = [0.0] * 8
-        _robot_cmd.Kp = [0.0] * 8
-        _robot_cmd.Kd = [0.0] * 8
-
-        # main loop
-        sdk_rate = sdk_robot.Rate(self.cfg.loop_freq)
-        step_num = 0
-
-        step_dt = 0.0
-        loop_dt = 0.0
-        policy_dt = 0.0
-        total_dt = 0.0
-
-        # TODO: flags
-
-        while True:
-            step_ns = time.perf_counter_ns()
-            step_num += 1
-
-            # fix data read from callbacks
-            imu_data = copy.deepcopy(self._imu_data)
-            robot_state = copy.deepcopy(self._robot_state)
-            sensor_joy = copy.deepcopy(self._sensor_joy)
-            diagnostic_value = copy.deepcopy(self._diagnostic_value)
-
-            imu_data_cnt = int(self._imu_data_cnt)
-            robot_state_cnt = int(self._robot_state_cnt)
-            sensor_joy_cnt = int(self._sensor_joy_cnt)
-            diagnostic_value_cnt = int(self._diagnostic_value_cnt)
-
-            usr_cmd = [0.5] * 7
-            # TODO
-
-            # arrays
-            s.quat_w = array(imu_data.quat)
-            s.angvel_b = array(imu_data.gyro)
-            s.linvel_b = np.zeros_like(s.angvel_b)
-            s.qpos = array(robot_state.q)
-            s.qvel = array(robot_state.dq)
-
-            # step policy-runner
-            t_ns = time.perf_counter_ns()
-            node = node.update()
-            loop_dt = (time.perf_counter_ns() - t_ns) / 1e9
-
-            # user cmd
-            if isinstance(node, RLPolicyNode):
-                node.set_cmd(array(usr_cmd[:6]), array(usr_cmd[6] > 0.6, dtype=np.bool_))
-
-            # write action to robot
-            _robot_cmd.q = s.qpos_trg.tolist()
-            _robot_cmd.Kp = s.kp.tolist()
-            _robot_cmd.Kd = s.kd.tolist()
-            self.sdk_robot.publishRobotCmd(_robot_cmd)
-
-            # TODO: robot flag 에 따른
-            self.sdk_robot.setRobotLightEffect(sdk_dtype.LightEffect.STATIC_WHITE)
-
-            # logging
-            if step_num % self.log_decimation == 0:
-                print(
-                    f'[limxsdk-lowlevel]\n'
-                    f'step-num: {step_num}\n'
-
-                    f'joy-axes: {" | ".join([f"{x:6.3f}" for x in sensor_joy.axes])}\n'
-                    f'joy-buttons: {" | ".join([f"{x}" for x in sensor_joy.buttons])}\n'
-                    f'motor-names: {robot_state.motor_names}\n'
-
-                    f'total-util: {total_dt * self.cfg.loop_freq:.4f} | '
-                    f'step-util: {step_dt * self.cfg.loop_freq:.4f} | '
-                    f'loop-util: {loop_dt * self.cfg.loop_freq:.4f} | '
-                    f'policy-util: {policy_dt * self.cfg.loop_freq:.4f}\n'
-
-                    f'cnt: {imu_data_cnt} | {robot_state_cnt} | {sensor_joy_cnt} | {diagnostic_value_cnt}\n'
-
-                    f'quat: {" | ".join([f"{x:6.3f}" for x in s.quat_w])}\n'
-                    f'lvel: {" | ".join([f"{x:6.3f}" for x in s.linvel_b])}\n'
-                    f'avel: {" | ".join([f"{x:6.3f}" for x in s.angvel_b])}\n'
-                    f'qpos: {" | ".join([f"{x:6.3f}" for x in s.qpos])}\n'
-                    f'qvel: {" | ".join([f"{x:6.3f}" for x in s.qvel])}\n'
-                    f'qtrg: {" | ".join([f"{x:6.3f}" for x in s.qpos_trg])}\n'
-                    f'ucmd: {" | ".join([f"{x:6.3f}" for x in usr_cmd])}\n'
-                )
-
-            # fix loop delta-time
-            step_dt = (time.perf_counter_ns() - step_ns) / 1e9
-            sdk_rate.sleep()
-            total_dt = (time.perf_counter_ns() - step_ns) / 1e9
+LOOP_FREQ = 400
+POLICY_FREQ = 50
+LOG_FREQ = 10
 
 
-if __name__ == '__main__':
-    # q-names
-    REF_Q_NAMES = [
-        'abad_L_Joint', 'hip_L_Joint', 'knee_L_Joint', 'ankle_L_Joint',
-        'abad_R_Joint', 'hip_R_Joint', 'knee_R_Joint', 'ankle_R_Joint',
-    ]
-    RL_Q_NAMES = [
-        'abad_L_Joint', 'abad_R_Joint',
-        'hip_L_Joint',  'hip_R_Joint',
-        'knee_L_Joint', 'knee_R_Joint',
-        'ankle_L_Joint','ankle_R_Joint',
-    ]
 
-    LOOP_FREQ = 400
-    POLICY_FREQ = 50
-    LOG_FREQ = 10
-
-    # build fsm graph
-    def array(data, dtype=np.float32):
-        return np.array(data, dtype=dtype)
+def build_robofsm_graph():
+    # build: robot-state
+    def tensor(data, dtype=th.float32, device=th.device('cpu')):
+        return th.tensor(data, dtype=dtype, device=device)
 
     robot_state = RobotState(
-        n_qdim=8,
+        n_qdim=len(REF_Q_NAMES),
         q_names=REF_Q_NAMES,
-        quat_w=array([1, 0, 0, 0]),
-        linvel_b=array([0, 0, 0]),
-        angvel_b=array([0, 0, 0]),
-        qpos=array([0] * 8),
-        qvel=array([0] * 8),
-        qpos_trg=array([0] * 8),
-        kp=array([0] * 8),
-        kd=array([0] * 8),
-        qpos_def=array([0] * 8),
-        kp_def=array([45] * 8),
-        kd_def=array([1.5] * 6 + [0.8] * 2),
+
+        quat_w=tensor([1, 0, 0, 0]),
+        linvel_b=tensor([0, 0, 0]),
+        angvel_b=tensor([0, 0, 0]),
+
+        qpos=tensor([0] * 8),
+        qvel=tensor([0] * 8),
+        qpos_trg=tensor([0] * 8),
+
+        kp=tensor([0] * 8),
+        kd=tensor([0] * 8),
+
+        qpos_def=tensor([0] * 8),
+        kp_def=tensor([45., 45., 45., 45., 45., 45., 45., 45.]),
+        kd_def=tensor([1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 0.8, 0.8]),
     )
 
+    # build: rl-policy
     rl_policy = RLPolicy(RLPolicyCfg(
         step_freq=LOOP_FREQ,
         policy_freq=POLICY_FREQ,
@@ -247,41 +72,272 @@ if __name__ == '__main__':
         action_scale=[0.5] * 8,
         obs_clip=(-100.0, 100.0),
         action_clip=(-100.0, 100.0),
-        vel_cmd_rng=[
-            (-1.5, 1.5),
-            (-1.0, 1.0),
-            (-1.0, 1.0),
-        ],
-        gait_cmd_rng=[
-            (0.8, 1.6),
-            (0.4, 0.6),
-            (np.pi / 2, np.pi / 2),
+        cmd_rng=[
+            (-1.5, 1.5), # linvel-x
+            (-1.0, 1.0), # linvel-y
+            (-1.0, 1.0), # angvel-z
+            (0.8, 1.6), # gait freq
+            (0.4, 0.6), # gait ratio
+            (th.pi/2, th.pi/2), # gait offset
         ],
         # model_path='models/tron1_s_flat.onnx',
         model_path='models/tron1_s_rough.onnx',
     ))
 
+    # build: fsm nodes
     hard_stop_node = HardStopNode(robot_state)
-    soft_stop_node = SoftStopNode(robot_state, duration=5.0)
-    rl_policy_node = RLPolicyNode(robot_state, rl_policy=rl_policy, duration=5.0)
+    soft_stop_node = SoftStopNode(robot_state, duration=3.0)
+    rl_policy_node = RLPolicyNode(robot_state, rl_policy=rl_policy, duration=1e-6)
 
-    # configure edge
-    # hard_stop_node.add_edge()
+    # edge triggers
+    axes = {
+        'linvel-x': 0.5,
+        'linvel-y': 0.5,
+        'angvel-z': 0.5,
+        'gait-freq': 0.5,
+        'gait-ratio': 0.5,
+        'gait-offset': 0.5,
+    }
+    btns = {
+        'hard-stop': False,
+        'soft-stop': False,
+        'rl-run': False,
+    }
+    cmd = (axes, btns)
 
-    # controller configuration
-    controller_cfg = ControllerCfg(
-        robot_ip='127.0.0.1',
-        # robot_ip='10.192.1.2',
-        loop_freq=LOOP_FREQ,
-        log_freq=LOG_FREQ,
+    rl_cmd = (
+        th.tensor([0.5] * 6, dtype=th.float32, device='cpu'),
+        th.tensor([False], dtype=th.bool, device='cpu'),
+    )
+    rl_policy_node.register_cmd(*rl_cmd)
+
+    # build: fsm edges
+    hard_stop_node.add_edge(
+        id='soft-stop', ord=0, next=soft_stop_node,
+        fn=lambda: btns['soft-stop'] and hard_stop_node.t > 1.0,
     )
 
-    # setup environment variable (limxsdk-lowlevel requires this)
+    soft_stop_node.add_edge(
+        id='emergency hard-stop', ord=0, next=hard_stop_node,
+        fn=lambda: btns['hard-stop'],
+    )
+    soft_stop_node.add_edge(
+        id='run rl-policy', ord=1, next=rl_policy_node,
+        fn=lambda: btns['rl-run'] and soft_stop_node.t > 5.0,
+    )
+
+    rl_policy_node.add_edge(
+        id='emergency hard-stop', ord=0, next=hard_stop_node,
+        fn=lambda: btns['hard-stop'],
+    )
+    rl_policy_node.add_edge(
+        id='emergency soft-stop', ord=1, next=soft_stop_node,
+        fn=lambda: btns['soft-stop'],
+    )
+
+    return hard_stop_node, cmd, rl_cmd
+
+
+
+def run_robofsm_graph(
+        root_node: BaseNode[RobotState],
+        cmd: tuple[dict, dict],
+        rl_cmd: tuple[th.Tensor, th.Tensor],
+        robot_ip: str,
+    ):
+    node = root_node
+    s = node.state
+
+    cmd_axes, cmd_btns = cmd
+    rl_cmd_axes, rl_cmd_btns = rl_cmd
+
+    log_decimation = LOOP_FREQ // LOG_FREQ
+
+    # init robot
+    robot = sdk_robot.Robot(
+        robot_type=sdk_robot.RobotType.PointFoot,
+        is_sim=False,
+    )
+    if not robot.init(robot_ip):
+        print(f'[{__name__}] robot initialization failed')
+        exit()
+
+    # logging metadata
+    print(
+        f'[{__name__}]\n'
+        f'motor number: {robot.getMotorNumber()}\n'
+    )
+
+    # buffers
+    _imu_data = sdk_dtype.ImuData()
+    _robot_state = sdk_dtype.RobotState()
+    _sensor_joy = sdk_dtype.SensorJoy()
+    _diagnostic_value = sdk_dtype.DiagnosticValue()
+    _imu_data_new = False
+    _robot_state_new = False
+    _sensor_joy_new = False
+    _diagnostic_value_new = False
+
+    # subscribe callbacks
+    def imu_data_callback(x: sdk_dtype.ImuData):
+        nonlocal _imu_data, _imu_data_new
+        _imu_data = x
+        _imu_data_new = True
+    def robot_state_callback(x: sdk_dtype.RobotState):
+        nonlocal _robot_state, _robot_state_new
+        _robot_state = x
+        _robot_state_new = True
+    def sensor_joy_callback(x: sdk_dtype.SensorJoy):
+        nonlocal _sensor_joy, _sensor_joy_new
+        _sensor_joy = x
+        _sensor_joy_new = True
+    def robot_diagnostic_callback(x: sdk_dtype.DiagnosticValue):
+        nonlocal _diagnostic_value, _diagnostic_value_new
+        _diagnostic_value = x
+        _diagnostic_value_new = True
+
+    robot.subscribeImuData(imu_data_callback)
+    robot.subscribeRobotState(robot_state_callback)
+    robot.subscribeSensorJoy(sensor_joy_callback)
+    robot.subscribeDiagnosticValue(robot_diagnostic_callback)
+
+    # main loop
+    rate = sdk_robot.Rate(LOOP_FREQ)
+    step_num = 0
+
+    step_dt = 0.0
+    sim_dt = 0.0
+    total_dt = 0.0
+
+    usr_axes = [0.5] * 6
+    usr_btns = [False] * 4
+
+    def tensor(data, dtype=th.float32, device=th.device('cpu')):
+        return th.tensor(data, dtype=dtype, device=device)
+    def norm_axis(a):
+        return min(1.0, max(0.0, 0.5 + 0.5 * float(a)))
+
+    while True:
+        step_ns = time.perf_counter_ns()
+        step_num += 1
+
+        # latch data read from callbacks
+        imu_data = copy.deepcopy(_imu_data)
+        robot_state = copy.deepcopy(_robot_state)
+        sensor_joy = copy.deepcopy(_sensor_joy)
+        diagnostic_value = copy.deepcopy(_diagnostic_value)
+
+        imu_data_new = bool(_imu_data_new)
+        _imu_data_new = False
+        robot_state_new = bool(_robot_state_new)
+        _robot_state_new = False
+        sensor_joy_new = bool(_sensor_joy_new)
+        _sensor_joy_new = False
+        diagnostic_value_new = bool(_diagnostic_value_new)
+        _diagnostic_value_new = False
+
+        # tensors
+        if imu_data_new:
+            s.quat_w = tensor(imu_data.quat)
+            s.angvel_b = tensor(imu_data.gyro)
+            s.linvel_b = th.zeros_like(s.angvel_b)
+        if robot_state_new:
+            s.qpos = tensor(robot_state.q)
+            s.qvel = tensor(robot_state.dq)
+        if sensor_joy_new:
+            usr_axes[0] = norm_axis(sensor_joy.axes[3])
+            usr_axes[1] = norm_axis(sensor_joy.axes[2])
+            usr_axes[2] = norm_axis(sensor_joy.axes[0])
+            usr_axes[3] = norm_axis(sensor_joy.axes[1])
+            usr_axes[4] = 0.5
+            usr_axes[5] = 0.5
+            usr_btns[0] = sensor_joy.buttons[14]
+            usr_btns[1] = sensor_joy.buttons[12]
+            usr_btns[2] = sensor_joy.buttons[15]
+
+        # command
+        cmd_axes = {
+            'linvel-x': 0.5,
+            'linvel-y': 0.5,
+            'angvel-z': 0.5,
+            'gait-freq': 0.5,
+            'gait-ratio': 0.5,
+            'gait-offset': 0.5,
+        }
+        cmd_axes['linvel-x'] = usr_axes[0]
+        cmd_axes['linvel-y'] = usr_axes[1]
+        cmd_axes['angvel-z'] = usr_axes[2]
+        cmd_axes['gait-freq'] = usr_axes[3]
+        cmd_axes['gait-ratio'] = usr_axes[4]
+        cmd_axes['gait-offset'] = usr_axes[5]
+        cmd_btns['hard-stop'] = usr_btns[0]
+        cmd_btns['soft-stop'] = usr_btns[1]
+        cmd_btns['rl-run'] = usr_btns[2]
+
+        rl_cmd_axes[0] = cmd_axes['linvel-x']
+        rl_cmd_axes[1] = cmd_axes['linvel-y']
+        rl_cmd_axes[2] = cmd_axes['angvel-z']
+        rl_cmd_axes[3] = cmd_axes['gait-freq']
+        rl_cmd_axes[4] = cmd_axes['gait-ratio']
+        rl_cmd_axes[5] = cmd_axes['gait-offset']
+        rl_cmd_btns[0] = (rl_cmd_axes[0:3] - 0.5).square().sum().sqrt() > 0.1
+
+        # step policy-runner
+        t_ns = time.perf_counter_ns()
+        node = node.update()
+        sim_dt = (time.perf_counter_ns() - t_ns) / 1e9
+
+        # write action to robot
+        qtau = s.kp * (s.qpos_trg - s.qpos) - s.kd * s.qvel
+
+        robot_cmd = sdk_dtype.RobotCmd()
+        robot_cmd.mode = [0.] * 8
+        robot_cmd.q = [0.] * 8
+        robot_cmd.dq = [0.] * 8
+        robot_cmd.tau = [0.] * 8
+        robot_cmd.Kp = [0.] * 8
+        robot_cmd.Kd = [0.] * 8
+
+        robot_cmd.q = s.qpos_trg.tolist()
+        robot_cmd.Kp = s.kp.tolist()
+        robot_cmd.Kd = s.kd.tolist()
+        robot.publishRobotCmd(robot_cmd)
+
+        # logging
+        if step_num % log_decimation == 0:
+            print(
+                f'[{__name__}]\n'
+                f'step-num: {step_num}\n'
+
+                f'total-util: {total_dt * LOOP_FREQ:.4f} | '
+                f'step-util: {step_dt * LOOP_FREQ:.4f} | '
+                f'sim-util: {sim_dt * LOOP_FREQ:.4f}\n'
+
+                f'quat: {" | ".join([f"{x:6.3f}" for x in s.quat_w])}\n'
+                f'lvel: {" | ".join([f"{x:6.3f}" for x in s.linvel_b])}\n'
+                f'avel: {" | ".join([f"{x:6.3f}" for x in s.angvel_b])}\n'
+                f'qpos: {" | ".join([f"{x:6.3f}" for x in s.qpos])}\n'
+                f'qvel: {" | ".join([f"{x:6.3f}" for x in s.qvel])}\n'
+                f'qtrg: {" | ".join([f"{x:6.3f}" for x in s.qpos_trg])}\n'
+                f'qtau: {" | ".join([f"{x:6.3f}" for x in qtau])}\n'
+                f'axes: {" | ".join([f"{x:6.3f}" for x in cmd_axes.values()])}\n'
+                f'btns: {" | ".join([f"{x:6.3f}" for x in cmd_btns.values()])}\n'
+            )
+
+        # fix loop delta-time
+        step_dt = (time.perf_counter_ns() - step_ns) / 1e9
+        while ((time.perf_counter_ns() - step_ns) / 1e9) * LOOP_FREQ < 1.0:
+            pass
+        total_dt = (time.perf_counter_ns() - step_ns) / 1e9
+
+
+
+if __name__ == '__main__':
     import os
     os.environ['ROBOT_TYPE'] = 'SF_TRON1B'
 
-    # run controller
-    controller = Controller(controller_cfg)
-    controller.run(hard_stop_node)
-    # controller.run(soft_stop_node)
-    # controller.run(rl_policy_node)
+    run_robofsm_graph(
+        *build_robofsm_graph(),
+        robot_ip='127.0.0.1',
+        # robot_ip='10.192.1.2',
+    )

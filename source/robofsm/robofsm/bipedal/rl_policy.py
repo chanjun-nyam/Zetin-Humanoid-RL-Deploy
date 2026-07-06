@@ -32,9 +32,7 @@ class RLPolicyCfg:
 
     action_clip: Tuple[float, float] = MISSING
 
-    vel_cmd_rng: List[Tuple[float, float]] = MISSING
-
-    gait_cmd_rng: List[Tuple[float, float]] = MISSING
+    cmd_rng: List[Tuple[float, float]] = MISSING
 
     model_path: str = MISSING
 
@@ -116,12 +114,10 @@ class RLPolicy:
         self.qvel = SMABuffer.init_like(self.qpos, (0,), self.decimation)
 
         # command
-        self.vel_cmd_rng = tensor(self.cfg.vel_cmd_rng)
-        self.gait_cmd_rng = tensor(self.cfg.gait_cmd_rng)
+        self.cmd_rng = tensor(self.cfg.cmd_rng)
 
         self.is_walk = tensor(False, dtype=th.bool)
-        self.vel_cmd = tensor([0, 0, 0])
-        self.gait_cmd = tensor([0, 0.5, th.pi]) # TODO
+        self.cmd = tensor([0, 0, 0, 0, 0.5, th.pi])
 
         # gait
         self.gait_clock = tensor(0)
@@ -148,8 +144,7 @@ class RLPolicy:
 
         # command
         self.is_walk.zero_()
-        self.vel_cmd.zero_()
-        self.gait_cmd.copy_(tensor([0, 0.5, th.pi])) # TODO
+        self.cmd.copy_(tensor([0, 0, 0, 0, 0.5, th.pi])) # TODO
 
         # gait
         self.gait_clock.zero_()
@@ -167,42 +162,41 @@ class RLPolicy:
             angvel: th.Tensor,
             qpos: th.Tensor,
             qvel: th.Tensor,
-            is_walk: th.Tensor,
-            usr_cmd: th.Tensor,
+            cmd_axes: th.Tensor,
+            cmd_btns: th.Tensor,
         ) -> th.Tensor:
         # update-buff: robot data
         self.root_quat_w.copy_(quat)
         self.root_linvel_b.update(linvel)
         self.root_angvel_b.update(angvel)
-        self.gravity_dir_b.copy_(quat_apply(quat_conj(self.root_quat_w), self.GRAVITY_DIR_W))
+        self.gravity_dir_b.copy_(
+            quat_apply(quat_conj(self.root_quat_w), self.GRAVITY_DIR_W)
+        )
         self.qpos.copy_(qpos)
         self.qvel.update(qvel)
 
         # update-buff: command
-        usr_cmd = usr_cmd.clip(0.0, 1.0)
+        cmd_axes = cmd_axes.clip(0.0, 1.0)
 
-        self.is_walk.copy_(is_walk)
-        self.vel_cmd.copy_(
-            self.vel_cmd_rng[:,0] + usr_cmd[0:3] * self.vel_cmd_rng.diff(n=1, dim=-1).squeeze(1)
-        )
-        self.gait_cmd.copy_(
-            self.gait_cmd_rng[:,0] + usr_cmd[3:6] * self.gait_cmd_rng.diff(n=1, dim=-1).squeeze(1)
+        self.is_walk.copy_(cmd_btns[0])
+        self.cmd.copy_(
+            self.cmd_rng[:,0] + cmd_axes * self.cmd_rng.diff(n=1, dim=-1).squeeze(1)
         )
 
         # update-buff: gait
         # TODO
-        self.gait_clock.add_((2.0 * th.pi * (1.0 / self.cfg.step_freq)) * self.gait_cmd[0])
+        self.gait_clock.add_((2.0 * th.pi * (1.0 / self.cfg.step_freq)) * self.cmd[3])
         self.gait_clock.remainder_(2.0 * th.pi)
 
         gait_theta = self.gait_clock.repeat(2).clone()
         gait_theta[0] += 0.0
-        gait_theta[1] += self.gait_cmd[2]
+        gait_theta[1] += self.cmd[5]
         self.gait_clock_signal.copy_(th.cat([gait_theta.sin(), gait_theta.cos()]))
 
         # apply `is_walk`
-        self.vel_cmd *= self.is_walk
-        # self.gait_cmd *= self.is_walk
-        self.gait_cmd[0] *= self.is_walk # TODO
+        self.cmd[0:3] *= self.is_walk
+        # self.cmd *= self.is_walk
+        self.cmd[3] *= self.is_walk # TODO
         self.gait_clock_signal *= self.is_walk
 
         # policy step
@@ -233,8 +227,7 @@ class RLPolicy:
 
         obs_tensor = th.cat([
             self.obs_hist.buff.view(-1),
-            self.vel_cmd,
-            self.gait_cmd[0:2],
+            self.cmd[0:5],
             self.gait_clock_signal,
             obs_priv,
         ], dim=-1)
