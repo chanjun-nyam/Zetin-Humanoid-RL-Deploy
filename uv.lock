@@ -4,7 +4,8 @@ requires-python = "==3.11.*"
 
 [manifest]
 members = [
-    "policy-runner",
+    "robofsm",
+    "robofsm-np",
     "zetin-humanoid-rl-deploy",
 ]
 
@@ -559,17 +560,6 @@ wheels = [
 ]
 
 [[package]]
-name = "policy-runner"
-version = "0.1.0"
-source = { editable = "source/Policy-Runner" }
-dependencies = [
-    { name = "torch" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "torch", specifier = ">=2.12.1" }]
-
-[[package]]
 name = "protobuf"
 version = "7.35.1"
 source = { registry = "https://pypi.org/simple" }
@@ -614,6 +604,22 @@ sdist = { url = "https://files.pythonhosted.org/packages/c0/8f/0722ca900cc807c13
 wheels = [
     { url = "https://files.pythonhosted.org/packages/82/3b/64d4899d73f91ba49a8c18a8ff3f0ea8f1c1d75481760df8c68ef5235bf5/rich-15.0.0-py3-none-any.whl", hash = "sha256:33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb", size = 310654, upload-time = "2026-04-12T08:24:02.83Z" },
 ]
+
+[[package]]
+name = "robofsm"
+version = "0.1.0"
+source = { editable = "source/robofsm" }
+dependencies = [
+    { name = "torch" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "torch", specifier = ">=2.12.1" }]
+
+[[package]]
+name = "robofsm-np"
+version = "0.1.0"
+source = { editable = "source/robofsm_np" }
 
 [[package]]
 name = "setuptools"
@@ -722,7 +728,8 @@ dependencies = [
     { name = "onnxruntime" },
     { name = "onnxscript" },
     { name = "opencv-python-headless" },
-    { name = "policy-runner" },
+    { name = "robofsm" },
+    { name = "robofsm-np" },
     { name = "simple-rl" },
     { name = "torch" },
     { name = "typer" },
@@ -736,7 +743,8 @@ requires-dist = [
     { name = "onnxruntime", specifier = ">=1.27.0" },
     { name = "onnxscript", specifier = ">=0.7.0" },
     { name = "opencv-python-headless", specifier = ">=4.13.0.92" },
-    { name = "policy-runner", editable = "source/Policy-Runner" },
+    { name = "robofsm", editable = "source/robofsm" },
+    { name = "robofsm-np", editable = "source/robofsm_np" },
     { name = "simple-rl", git = "https://github.com/chanjun-nyam/Simple-RL.git" },
     { name = "torch", specifier = ">=2.12.1" },
     { name = "typer", specifier = ">=0.26.7" },

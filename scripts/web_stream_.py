@@ -97,19 +97,11 @@ INDEX_HTML = """<!doctype html>
   .row label { width: 40px; }
   .row input { flex: 1; }
   .row span { width: 56px; text-align: right; }
-  .btns { width: __WIDTH__px; max-width: 100%; display: flex; gap: 12px; }
-  button { flex: 1; padding: 10px; background: #222; color: #eee; border: 1px solid #444;
-           font-family: monospace; font-size: 14px; cursor: pointer; }
-  button:hover { background: #333; }
-  button:active { background: #555; }
 </style>
 </head>
 <body>
   <div class="wrap">
     <img id="view" src="/stream" width="__WIDTH__" height="__HEIGHT__">
-    <div class="btns">
-      <button id="reset">reset</button>
-    </div>
     <div class="sliders">
 __ROWS__
     </div>
@@ -130,9 +122,6 @@ __ROWS__
     const q = idx.map(i => `s${i}=${s[i].value}`).join('&');
     fetch(`/cmd?${q}`).catch(() => {});
   }, 50);
-  document.getElementById('reset').addEventListener('click', () => {
-    fetch('/reset').catch(() => {});
-  });
 </script>
 </body>
 </html>
@@ -166,8 +155,6 @@ class _Handler(BaseHTTPRequestHandler):
             self._serve_stream(app)
         elif parsed.path == '/cmd':
             self._serve_cmd(app, parse_qs(parsed.query))
-        elif parsed.path == '/reset':
-            self._serve_reset(app)
         else:
             self.send_error(404)
 
@@ -221,11 +208,6 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(204)
         self.end_headers()
 
-    def _serve_reset(self, app):
-        app.request_reset()
-        self.send_response(204)
-        self.end_headers()
-
 
 class _HTTPServer(ThreadingHTTPServer):
 
@@ -254,11 +236,6 @@ class WebStreamServer:
         # command vector matches cfg.sliders in length and order
         self._cmd = [sl.value for sl in cfg.sliders]
         self._cmd_lock = threading.Lock()
-
-        # one-shot reset request, raised by the /reset endpoint and consumed
-        # by the simulation loop via consume_reset().
-        self._reset_flag = False
-        self._reset_lock = threading.Lock()
 
         # http server in a background thread
         self._httpd = _HTTPServer((cfg.host, cfg.port), self)
@@ -297,17 +274,3 @@ class WebStreamServer:
         ]
         with self._cmd_lock:
             self._cmd = clipped
-
-
-    # called from the http handler thread (/reset button)
-    def request_reset(self):
-        with self._reset_lock:
-            self._reset_flag = True
-
-
-    # called from the simulation loop; returns True once per reset request.
-    def consume_reset(self):
-        with self._reset_lock:
-            flag = self._reset_flag
-            self._reset_flag = False
-        return flag

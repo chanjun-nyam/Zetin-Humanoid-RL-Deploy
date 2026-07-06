@@ -11,7 +11,8 @@ dependencies = [
     "onnxruntime>=1.27.0",
     "onnxscript>=0.7.0",
     "opencv-python-headless>=4.13.0.92",
-    "policy-runner",
+    "robofsm",
+    "robofsm-np",
     "simple-rl",
     "torch>=2.12.1",
     "typer>=0.26.7",
@@ -19,9 +20,11 @@ dependencies = [
 
 [tool.uv.workspace]
 members = [
-    "source/Policy-Runner",
+    "source/robofsm",
+    "source/robofsm_np",
 ]
 
 [tool.uv.sources]
 simple-rl = { git = "https://github.com/chanjun-nyam/Simple-RL.git" }
-policy-runner = { workspace = true }
+robofsm = { workspace = true }
+robofsm-np = { workspace = true }

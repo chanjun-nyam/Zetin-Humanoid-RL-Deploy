@@ -23,6 +23,7 @@
     "autoDocstring.docstringFormat": "google",
 
     "python.analysis.extraPaths": [
-        "${env:HOME}/workspace/Projects/Zetin-Humanoid-RL-Deploy/source/Policy-Runner",
+        "${env:HOME}/workspace/Projects/Zetin-Humanoid-RL-Deploy/source/robofsm",
+        "${env:HOME}/workspace/Projects/Zetin-Humanoid-RL-Deploy/source/robofsm_np",
     ],
 }

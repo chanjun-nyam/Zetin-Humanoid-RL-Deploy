@@ -1,283 +1,287 @@
+# Copyright information
+#
+# © [2024] LimX Dynamics Technology Co., Ltd. All rights reserved.
+#
+# Web-stream variant: renders the MuJoCo scene off-screen and serves it over
+# HTTP (see web_stream.py) instead of opening a local mujoco.viewer window.
+# The limxsdk robot I/O (command subscribe + state/IMU publish) is unchanged.
+
 import os
 
-# offscreen rendering backend (set before mujoco creates any gl context).
-# 'egl' for headless gpu servers, 'osmesa' for cpu-only. override via env var.
+# Off-screen rendering backend — MUST be set before mujoco creates a GL context.
+# 'egl' for a headless GPU server, 'osmesa' for CPU-only. Override via env var.
 os.environ.setdefault('MUJOCO_GL', 'egl')
 
-from dataclasses import dataclass, MISSING
-from typing import Callable, List, Optional
+import sys
 import time
+from functools import partial
 
-import mujoco as mj
-import torch as th
+import mujoco
 
-from policy_runner import PolicyRunner, PolicyRunnerCfg
-from web_stream import WebStreamServer, WebStreamCfg
+import limxsdk
+import limxsdk.robot.Rate as Rate
+import limxsdk.robot.Robot as Robot
+import limxsdk.robot.RobotType as RobotType
+import limxsdk.datatypes as datatypes
 
-
-
-@dataclass
-class SimulatorCfg:
-
-    mjcf_path: str = MISSING
-
-    sim_freq: int = MISSING
-
-    rend_freq: int = MISSING
-
-    log_freq: int = MISSING
-
-    q_names: List[str] = MISSING
-
-    qpos_default: List[float] = MISSING
-
-    q_kp: List[float] = MISSING
-
-    q_kd: List[float] = MISSING
-
-    zero_cmd_norm: float = MISSING
-
-    policy_runner_cfg: PolicyRunnerCfg = MISSING
+# The web rendering module you provided.
+from web_stream import WebStreamServer, WebStreamCfg, SliderCfg
 
 
+class SimulatorMujoco:
+    def __init__(self, asset_path, joint_sensor_names, robot, web_cfg=None,
+                 quat_sensor_names=None, gyro_sensor_names=None, acc_sensor_names=None,
+                 reset_keyframe=None):
+        self.robot = robot
+        self.joint_sensor_names = joint_sensor_names
+        self.joint_num = len(joint_sensor_names)
 
-class Simulator:
+        # Load the MuJoCo model and data from the specified XML asset path
+        self.mujoco_model = mujoco.MjModel.from_xml_path(asset_path)
+        self.mujoco_data = mujoco.MjData(self.mujoco_model)
 
-    def __init__(self, cfg: SimulatorCfg):
-        self.cfg = cfg
-        self.policy_decimation = cfg.policy_runner_cfg.decimation
-        self.rend_decimation = cfg.sim_freq // cfg.rend_freq
-        self.log_decimation = cfg.sim_freq // cfg.log_freq
+        self.dt = self.mujoco_model.opt.timestep     # Simulation timestep
+        self.fps = 1.0 / self.dt                     # Physics steps per second
 
-        # rendering / user-command hooks (registered via register_* methods below)
-        self._render_callback: Optional[Callable] = None
-        self._cmd_callback: Optional[Callable] = None
+        # IMU sensor-name candidates. Different MJCFs name the IMU sensors
+        # differently (pointfoot: quat/gyro/acc; some humanoids: quat/angvel/
+        # linacc). We try each candidate in order and use the first that exists.
+        self.quat_sensor_names = quat_sensor_names or ['quat', 'orientation', 'imu_quat']
+        self.gyro_sensor_names = gyro_sensor_names or ['gyro', 'angvel', 'imu_gyro', 'angular_velocity']
+        self.acc_sensor_names  = acc_sensor_names  or ['acc', 'linacc', 'accelerometer', 'imu_acc', 'linear_acceleration']
 
-        # init policy-runner
-        self.policy_runner = PolicyRunner(cfg.policy_runner_cfg)
+        # Print what sensors the model actually has (handy when names mismatch).
+        available = [mujoco.mj_id2name(self.mujoco_model, mujoco.mjtObj.mjOBJ_SENSOR, i)
+                     for i in range(self.mujoco_model.nsensor)]
+        print(f"[simulator] model sensors: {available}")
 
-        # init mujoco
-        self.mj_model = mj.MjModel.from_xml_path(self.cfg.mjcf_path)
-        self.mj_data = mj.MjData(self.mj_model)
+        # ---- Reset keyframe selection ----------------------------------------
+        # If the MJCF defines keyframes, reset() puts the robot back into one
+        # (a proper standing pose) instead of the bare zero-pose default. You
+        # can force a specific keyframe by name via reset_keyframe.
+        self.reset_key_id = -1
+        if self.mujoco_model.nkey > 0:
+            if reset_keyframe is not None:
+                self.reset_key_id = mujoco.mj_name2id(
+                    self.mujoco_model, mujoco.mjtObj.mjOBJ_KEY, reset_keyframe)
+            if self.reset_key_id == -1:
+                # try common names, else fall back to the first keyframe
+                for name in ['home', 'stand', 'default', 'init']:
+                    kid = mujoco.mj_name2id(self.mujoco_model, mujoco.mjtObj.mjOBJ_KEY, name)
+                    if kid != -1:
+                        self.reset_key_id = kid
+                        break
+                if self.reset_key_id == -1:
+                    self.reset_key_id = 0
+        key_desc = (f"keyframe #{self.reset_key_id}"
+                    if self.reset_key_id >= 0 else "zero-pose (mj_resetData)")
+        print(f"[simulator] reset target: {key_desc}")
 
-        self.mj_model.opt.timestep = 1.0 / cfg.sim_freq
+        # ---- Web stream (replaces the passive mujoco.viewer) -----------------
+        # WebStreamServer starts an HTTP server in a background thread and
+        # exposes render_frame()/get_cmd()/consume_reset(). We render from THIS
+        # (sim) thread, because the GL context created inside render_frame is
+        # thread-local.
+        self.web_cfg = web_cfg if web_cfg is not None else WebStreamCfg()
+        self.web_stream = WebStreamServer(self.web_cfg)
 
+        # Render at the configured stream frequency, not every physics step
+        # (off-screen render + JPEG encode is far too slow to run every step).
+        self.rend_decimation = max(1, int(round(self.fps / self.web_cfg.stream_freq)))
 
-    def register_render_callback(self, callback: Callable):
-        self._render_callback = callback
+        # Latest user-command vector from the web sliders (see note in run()).
+        self.user_cmd = self.web_stream.get_cmd()
 
+        # Initialize robot command data with default values
+        self.robot_cmd = datatypes.RobotCmd()
+        self.robot_cmd.mode = [0. for _ in range(self.joint_num)]
+        self.robot_cmd.q = [0. for _ in range(self.joint_num)]
+        self.robot_cmd.dq = [0. for _ in range(self.joint_num)]
+        self.robot_cmd.tau = [0. for _ in range(self.joint_num)]
+        self.robot_cmd.Kp = [0. for _ in range(self.joint_num)]
+        self.robot_cmd.Kd = [0. for _ in range(self.joint_num)]
 
-    def register_cmd_callback(self, callback: Callable):
-        self._cmd_callback = callback
+        # Initialize robot state data with default values
+        self.robot_state = datatypes.RobotState()
+        self.robot_state.tau = [0. for _ in range(self.joint_num)]
+        self.robot_state.q = [0. for _ in range(self.joint_num)]
+        self.robot_state.dq = [0. for _ in range(self.joint_num)]
 
+        # Initialize IMU data structure
+        self.imu_data = datatypes.ImuData()
+
+        # Set up callback for receiving robot commands in simulation mode
+        self.robotCmdCallbackPartial = partial(self.robotCmdCallback)
+        self.robot.subscribeRobotCmdForSim(self.robotCmdCallbackPartial)
+
+    # Callback function for receiving robot command data
+    def robotCmdCallback(self, robot_cmd: datatypes.RobotCmd):
+        self.robot_cmd = robot_cmd
+
+    def _resolve_sensor(self, candidates):
+        """Return (name, id, adr, dim) of the first candidate that exists, else (None, -1, -1, 0)."""
+        for name in candidates:
+            sid = mujoco.mj_name2id(self.mujoco_model, mujoco.mjtObj.mjOBJ_SENSOR, name)
+            if sid != -1:
+                return name, sid, int(self.mujoco_model.sensor_adr[sid]), int(self.mujoco_model.sensor_dim[sid])
+        return None, -1, -1, 0
+
+    def reset(self):
+        """Restore the simulation to its initial state (keyframe or zero-pose)."""
+        if self.reset_key_id >= 0:
+            mujoco.mj_resetDataKeyframe(self.mujoco_model, self.mujoco_data, self.reset_key_id)
+        else:
+            mujoco.mj_resetData(self.mujoco_model, self.mujoco_data)
+        # clear actuator commands so the last PD target doesn't fling the robot
+        self.mujoco_data.ctrl[:] = 0.0
+        # recompute derived quantities (sensordata, etc.) for the new state
+        mujoco.mj_forward(self.mujoco_model, self.mujoco_data)
+        print("[simulator] reset")
 
     def run(self):
-        mj_model = self.mj_model
-        mj_data = self.mj_data
+        frame_count = 0
+        self.rate = Rate(self.fps)  # Maintain the loop at the physics rate
 
-        dtype = th.float32
-        device = th.device(self.cfg.policy_runner_cfg.device)
-        def float_tensor(x):
-            return th.tensor(x, dtype=dtype, device=device)
+        model = self.mujoco_model
+        data = self.mujoco_data
 
-        policy = self.policy_runner
+        # Resolve IMU sensors ONCE, validating each one. If a name is missing,
+        # mj_name2id returns -1 and sensor_adr[-1] would silently point at the
+        # last sensor -> out-of-bounds reads. So we fail loudly instead.
+        quat_name, quat_id, quat_adr, quat_dim = self._resolve_sensor(self.quat_sensor_names)
+        gyro_name, gyro_id, gyro_adr, gyro_dim = self._resolve_sensor(self.gyro_sensor_names)
+        acc_name,  acc_id,  acc_adr,  acc_dim  = self._resolve_sensor(self.acc_sensor_names)
 
-        # preprocess: q-related quantaties
-        ref_q_names = [mj.mj_id2name(mj_model, mj.mjtObj.mjOBJ_JOINT, i) for i in range(mj_model.njnt)][1:]
-        q_names = self.cfg.q_names
+        missing = []
+        if quat_id == -1: missing.append(f"quat (tried {self.quat_sensor_names})")
+        if gyro_id == -1: missing.append(f"gyro (tried {self.gyro_sensor_names})")
+        if acc_id  == -1: missing.append(f"acc  (tried {self.acc_sensor_names})")
+        if missing:
+            available = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_SENSOR, i)
+                         for i in range(model.nsensor)]
+            raise RuntimeError(
+                "IMU sensor(s) not found: " + "; ".join(missing) + ".\n"
+                f"Available sensors in this model: {available}.\n"
+                "Pass the correct names via quat_sensor_names / gyro_sensor_names / acc_sensor_names."
+            )
 
-        to_q_ref = [q_names.index(x) for x in ref_q_names]
-        from_q_ref = [ref_q_names.index(x) for x in q_names]
+        print(f"[simulator] IMU mapping -> quat:'{quat_name}'({quat_dim}) "
+              f"gyro:'{gyro_name}'({gyro_dim}) acc:'{acc_name}'({acc_dim})")
 
-        # preprocess: sensor data indices
-        sensor_names = ['quat', 'linvel', 'linacc', 'angvel']
-        sensor_ids = [mj.mj_name2id(mj_model, mj.mjtObj.mjOBJ_SENSOR, x) for x in sensor_names]
-        sensor_slices = [
-            slice(mj_model.sensor_adr[x], mj_model.sensor_adr[x] + mj_model.sensor_dim[x])
-            for x in sensor_ids
-        ]
-        sensor_name2slice = {a: b for a, b in zip(sensor_names, sensor_slices)}
+        try:
+            while True:
+                # Handle a reset requested from the web UI before stepping.
+                if self.web_stream.consume_reset():
+                    self.reset()
 
-        # buffers
-        qpos_default = float_tensor(self.cfg.qpos_default)
-        q_kp = float_tensor(self.cfg.q_kp)
-        q_kd = float_tensor(self.cfg.q_kd)
+                # Step the MuJoCo physics simulation
+                mujoco.mj_step(model, data)
 
-        gait_theta = float_tensor([0.0, 0.0])
+                # Update robot state and apply PD control from the robot command
+                for i in range(self.joint_num):
+                    self.robot_state.q[i] = data.qpos[i + 7]
+                    self.robot_state.dq[i] = data.qvel[i + 6]
+                    self.robot_state.tau[i] = data.ctrl[i]
 
-        usr_cmd = [
-            0.0, # linvel-x
-            0.0, # linvel-y
-            0.0, # angvel-z
-            0.0, # gait frequency
-            0.5, # gait ratio
-            th.pi, # gait offset
-        ]
+                    data.ctrl[i] = (
+                        self.robot_cmd.Kp[i] * (self.robot_cmd.q[i] - self.robot_state.q[i]) +
+                        self.robot_cmd.Kd[i] * (self.robot_cmd.dq[i] - self.robot_state.dq[i]) +
+                        self.robot_cmd.tau[i]
+                    )
 
-        from policy_runner.utils import SMABuffer
-        vel_buff = SMABuffer.init_like(float_tensor([0.0] * 3), (0,), self.cfg.sim_freq)
+                # Timestamp + publish robot state
+                self.robot_state.stamp = time.time_ns()
+                self.robot.publishRobotStateForSim(self.robot_state)
 
-        # main loop
-        step_num = 0
+                # Extract IMU data (orientation, gyro, acceleration)
+                self.imu_data.quat[0] = data.sensordata[quat_adr + 0]
+                self.imu_data.quat[1] = data.sensordata[quat_adr + 1]
+                self.imu_data.quat[2] = data.sensordata[quat_adr + 2]
+                self.imu_data.quat[3] = data.sensordata[quat_adr + 3]
 
-        step_dt = 0.0
-        sim_dt = 0.0
-        policy_dt = 0.0
-        rend_dt = 0.0
-        total_dt = 0.0
+                self.imu_data.gyro[0] = data.sensordata[gyro_adr + 0]
+                self.imu_data.gyro[1] = data.sensordata[gyro_adr + 1]
+                self.imu_data.gyro[2] = data.sensordata[gyro_adr + 2]
 
-        while True:
-            step_ns = time.perf_counter_ns()
-            step_num += 1
+                self.imu_data.acc[0] = data.sensordata[acc_adr + 0]
+                self.imu_data.acc[1] = data.sensordata[acc_adr + 1]
+                self.imu_data.acc[2] = data.sensordata[acc_adr + 2]
 
-            # step mujoco simulator
-            mj.mj_step(mj_model, mj_data)
+                # Timestamp + publish IMU data
+                self.imu_data.stamp = time.time_ns()
+                self.robot.publishImuDataForSim(self.imu_data)
 
-            # tensors
-            quat = th.from_numpy(mj_data.sensordata[sensor_name2slice['quat']])
-            linvel = th.from_numpy(mj_data.sensordata[sensor_name2slice['linvel']])
-            angvel = th.from_numpy(mj_data.sensordata[sensor_name2slice['angvel']])
-            qpos = th.from_numpy(mj_data.qpos[7:])[from_q_ref]
-            qvel = th.from_numpy(mj_data.qvel[6:])[from_q_ref]
+                # ---- Render via the web module (replaces viewer.sync) --------
+                if frame_count % self.rend_decimation == 0:
+                    # Pull the latest slider values. In this SDK-driven sim the
+                    # actual joint control comes from the external robot process
+                    # (robotCmdCallback), so these sliders are NOT used for
+                    # control by default — they are just available as a user
+                    # command channel. Forward them to the robot here if you
+                    # want a virtual joystick (SDK-specific call).
+                    self.user_cmd = self.web_stream.get_cmd()
 
-            # gait
-            vel_cmd = float_tensor(usr_cmd[0:3])
-            gait_freq = float_tensor(usr_cmd[3])
-            gait_ratio = float_tensor(usr_cmd[4])
-            gait_offset = float_tensor(usr_cmd[5])
+                    # Push a freshly rendered frame to all connected browsers.
+                    self.web_stream.render_frame(model, data)
 
-            gait_theta[0].add_((2.0 * th.pi * (1.0 / self.cfg.sim_freq)) * gait_freq)
-            gait_theta[1].copy_(gait_theta[0] + gait_offset)
-            gait_theta.remainder_(2.0 * th.pi)
-
-            # apply zero-cmd
-            is_walk = float_tensor(usr_cmd[0:3]).square().sum(dim=0).sqrt() > self.cfg.zero_cmd_norm
-            vel_cmd *= is_walk
-            gait_freq *= is_walk
-
-            vel_buff.update(th.cat([linvel[0:2], angvel[2:3]]))
-
-            # step policy-runner
-            s = time.perf_counter_ns()
-            policy.sim_step(quat, linvel, angvel, qpos - qpos_default, qvel)
-            sim_dt = (time.perf_counter_ns() - s) / 1e9
-
-            # policy step
-            if step_num % self.policy_decimation == 0:
-                command = th.cat([vel_cmd, th.stack([gait_freq, gait_ratio, gait_offset])], dim=-1)
-                clock = th.cat([gait_theta.sin(), gait_theta.cos()], dim=-1)
-
-                s = time.perf_counter_ns()
-                policy.policy_step(command[0:5], clock * is_walk)
-                policy_dt = (time.perf_counter_ns() - s) / 1e9
-
-            # write action to robot
-            qpos_trg = qpos_default + policy.action * policy.q_scale
-            qtau = q_kp * (qpos_trg - qpos) - q_kd * qvel
-            mj_data.ctrl[:] = qtau[to_q_ref].numpy()
-
-            # render-rate hooks: pull user-command, push rendered frame
-            if step_num % self.rend_decimation == 0:
-                s = time.perf_counter_ns()
-                if self._cmd_callback is not None:
-                    usr_cmd = self._cmd_callback()
-                if self._render_callback is not None:
-                    self._render_callback(mj_model, mj_data)
-                rend_dt = (time.perf_counter_ns() - s) / 1e9
-
-            # logging
-            if step_num % self.log_decimation == 0:
-                print(
-                    f'[simulator]\n'
-                    f'step-num: {step_num}\n'
-
-                    f'total-util: {total_dt * self.cfg.sim_freq:.4f} | '
-                    f'step-util: {step_dt * self.cfg.sim_freq:.4f} | '
-                    f'sim-util: {sim_dt * self.cfg.sim_freq:.4f} | '
-                    f'policy-util: {policy_dt * self.cfg.sim_freq:.4f} | '
-                    f'rend-util: {rend_dt * self.cfg.sim_freq:.4f}\n'
-
-                    f'quat: {" | ".join([f"{x:6.3f}" for x in policy.quat])}\n'
-                    f'lvel: {" | ".join([f"{x:6.3f}" for x in policy.linvel.sma])}\n'
-                    f'avel: {" | ".join([f"{x:6.3f}" for x in policy.angvel.sma])}\n'
-                    f'avgv: {" | ".join([f"{x:6.3f}" for x in vel_buff.sma])}\n'
-                    f'qpos: {" | ".join([f"{x:6.3f}" for x in policy.qpos])}\n'
-                    f'qvel: {" | ".join([f"{x:6.3f}" for x in policy.qvel.sma])}\n'
-                    f'qtrg: {" | ".join([f"{x:6.3f}" for x in qpos_trg])}\n'
-                    f'qtau: {" | ".join([f"{x:6.3f}" for x in qtau])}\n'
-                    f'ucmd: {" | ".join([f"{x:6.3f}" for x in usr_cmd])}\n'
-                )
-
-            # fix loop delta-time
-            step_dt = (time.perf_counter_ns() - step_ns) / 1e9
-            while ((time.perf_counter_ns() - step_ns) / 1e9) * self.cfg.sim_freq < 1.0:
-                pass
-            total_dt = (time.perf_counter_ns() - step_ns) / 1e9
-
+                frame_count += 1
+                self.rate.sleep()  # Keep the loop at the physics rate
+        except KeyboardInterrupt:
+            print("\n[simulator] stopped.")
 
 
 if __name__ == '__main__':
-    # q-names
-    USD_Q_NAMES = [
-        'abad_L_Joint', 'abad_R_Joint',
-        'hip_L_Joint',  'hip_R_Joint',
-        'knee_L_Joint', 'knee_R_Joint',
-        'ankle_L_Joint','ankle_R_Joint',
-    ]
+    os.environ['ROBOT_TYPE'] = 'SF_TRON1B'
+    # Create a Robot instance of the PointFoot type
+    robot = Robot(RobotType.PointFoot, True)
 
-    SIM_FREQ = 400
-    POLICY_FREQ = 50
-    REND_FREQ = 50
-    LOG_FREQ = 10
+    # Default IP address for the robot
+    robot_ip = "127.0.0.1"
 
-    # controller configuration
-    simulator_cfg = SimulatorCfg(
-        mjcf_path='assets/Tron1-S/robot.xml',
+    # Initialize the robot with the provided IP address
+    if not robot.init(robot_ip):
+        sys.exit()
 
-        sim_freq=SIM_FREQ,
-        rend_freq=REND_FREQ,
-        log_freq=LOG_FREQ,
+    # Robot model XML path based on the robot type (same layout as before)
+    model_path = 'assets/Tron1-S/robot.xml'
 
-        q_names=USD_Q_NAMES,
-        qpos_default=[0.0] * 8,
-        q_kp=[45., 45., 45., 45., 45., 45., 45., 45.],
-        q_kd=[1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 0.8, 0.8],
+    # Joint sensor names by robot family (unchanged)
+    if False:
+        joint_sensor_names = [
+            "abad_L_Joint", "hip_L_Joint", "knee_L_Joint", "wheel_L_Joint",
+            "abad_R_Joint", "hip_R_Joint", "knee_R_Joint", "wheel_R_Joint",
+        ]
+    elif True:
+        joint_sensor_names = [
+            "abad_L_Joint", "hip_L_Joint", "knee_L_Joint", "ankle_L_Joint",
+            "abad_R_Joint", "hip_R_Joint", "knee_R_Joint", "ankle_R_Joint",
+        ]
+    else:
+        joint_sensor_names = [
+            "abad_L_Joint", "hip_L_Joint", "knee_L_Joint",
+            "abad_R_Joint", "hip_R_Joint", "knee_R_Joint",
+        ]
 
-        zero_cmd_norm=0.2,
-
-        policy_runner_cfg=PolicyRunnerCfg(
-            decimation=SIM_FREQ // POLICY_FREQ,
-            device='cpu',
-            ref_q_names=USD_Q_NAMES,
-            q_names=USD_Q_NAMES,
-            q_scale=[0.5] * 8,
-            n_history=10,
-            obs_scale=[0.25, 1.0, 1.0, 0.05, 1.0, 1.0],
-            obs_clip=(-100.0, 100.0),
-            action_clip=(-100.0, 100.0),
-            model_path='models/tron1_s_flat.onnx',
-        ),
+    # Web stream configuration (open http://<host>:8000 in a browser).
+    # camera='' -> free camera. Set camera='track' only if robot.xml defines it.
+    web_cfg = WebStreamCfg(
+        host='0.0.0.0',
+        port=8000,
+        width=640,
+        height=480,
+        camera='',
+        jpeg_quality=80,
+        stream_freq=50,
+        sliders=[
+            SliderCfg('vx', -1.5, 1.5),
+            SliderCfg('vy', -1.0, 1.0),
+            SliderCfg('wz', -1.0, 1.0),
+        ],
     )
 
-    # build simulator
-    simulator = Simulator(simulator_cfg)
-
-    # reachable over an ssh-forwarded tcp port (default 8000).
-    web_stream = WebStreamServer(
-        cfg = WebStreamCfg(
-            host='0.0.0.0',
-            port=8000,
-            width=600,
-            height=400,
-            camera='track',
-            jpeg_quality=80,
-            stream_freq=REND_FREQ,
-        )
-    )
-
-    # register rendering + user-command as callbacks on the simulator
-    simulator.register_render_callback(web_stream.render_frame)
-    simulator.register_cmd_callback(web_stream.get_cmd)
-
-    # run controller
+    # Create and run the web-streamed MuJoCo simulator.
+    # If your model names the IMU sensors differently, override here, e.g.:
+    #   gyro_sensor_names=['angvel'], acc_sensor_names=['linacc']
+    # To reset to a specific keyframe: reset_keyframe='home'
+    simulator = SimulatorMujoco(model_path, joint_sensor_names, robot, web_cfg)
     simulator.run()
