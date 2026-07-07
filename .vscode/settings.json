@@ -24,6 +24,5 @@
 
     "python.analysis.extraPaths": [
         "${env:HOME}/workspace/Projects/Zetin-Humanoid-RL-Deploy/source/robofsm",
-        "${env:HOME}/workspace/Projects/Zetin-Humanoid-RL-Deploy/source/robofsm_np",
     ],
 }

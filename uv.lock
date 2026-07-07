@@ -380,6 +380,7 @@ dependencies = [
     { name = "mujoco" },
     { name = "opencv-python-headless" },
     { name = "pillow" },
+    { name = "robofsm" },
 ]
 
 [package.metadata]
@@ -387,6 +388,7 @@ requires-dist = [
     { name = "mujoco", specifier = ">=3.10.0" },
     { name = "opencv-python-headless", specifier = ">=5.0.0.93" },
     { name = "pillow", specifier = ">=12.3.0" },
+    { name = "robofsm", editable = "source/robofsm" },
 ]
 
 [[package]]
