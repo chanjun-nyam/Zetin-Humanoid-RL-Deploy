@@ -215,7 +215,7 @@ def run_robofsm_graph(
     usr_btns = [False] * 4
 
     robot_cmd = sdk_dtype.RobotCmd()
-    robot_cmd.mode = [0.] * 8
+    robot_cmd.mode = [0] * 8
     robot_cmd.q = [0.] * 8
     robot_cmd.dq = [0.] * 8
     robot_cmd.tau = [0.] * 8
@@ -226,6 +226,8 @@ def run_robofsm_graph(
         return th.tensor(data, dtype=dtype, device=device)
     def norm_axis(a):
         return min(1.0, max(0.0, 0.5 + 0.5 * float(a)))
+
+    _qtau = tensor([0.] * 8)
 
     while True:
         step_ns = time.perf_counter_ns()
@@ -254,6 +256,7 @@ def run_robofsm_graph(
         if robot_state_new:
             s.qpos = tensor(robot_state.q)
             s.qvel = tensor(robot_state.dq)
+            _qtau = tensor(robot_state.tau)
         if sensor_joy_new:
             usr_axes[0] = norm_axis(sensor_joy.axes[3])
             usr_axes[1] = norm_axis(sensor_joy.axes[2])
@@ -335,6 +338,7 @@ def run_robofsm_graph(
                 f'kp  : {" | ".join([f"{x:6.3f}" for x in s.kp])}\n'
                 f'kd  : {" | ".join([f"{x:6.3f}" for x in s.kd])}\n'
                 f'qtau: {" | ".join([f"{x:6.3f}" for x in qtau])}\n'
+                f'qtau: {" | ".join([f"{x:6.3f}" for x in _qtau])}\n'
 
                 f'axes: {" | ".join([f"{x:6.3f}" for x in cmd_axes.values()])}\n'
                 f'btns: {" | ".join([f"{x:6.3f}" for x in cmd_btns.values()])}\n'
