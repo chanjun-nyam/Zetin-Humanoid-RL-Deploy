@@ -29,7 +29,7 @@ RL_Q_NAMES = [
     'ankle_L_Joint','ankle_R_Joint',
 ]
 
-LOOP_FREQ = 400
+LOOP_FREQ = 300
 POLICY_FREQ = 50
 LOG_FREQ = 10
 
@@ -209,8 +209,18 @@ def run_robofsm_graph(
     sim_dt = 0.0
     total_dt = 0.0
 
+    total_utils_buff = [0.0] * LOOP_FREQ
+
     usr_axes = [0.5] * 6
     usr_btns = [False] * 4
+
+    robot_cmd = sdk_dtype.RobotCmd()
+    robot_cmd.mode = [0.] * 8
+    robot_cmd.q = [0.] * 8
+    robot_cmd.dq = [0.] * 8
+    robot_cmd.tau = [0.] * 8
+    robot_cmd.Kp = [0.] * 8
+    robot_cmd.Kd = [0.] * 8
 
     def tensor(data, dtype=th.float32, device=th.device('cpu')):
         return th.tensor(data, dtype=dtype, device=device)
@@ -290,18 +300,18 @@ def run_robofsm_graph(
         # write action to robot
         qtau = s.kp * (s.qpos_trg - s.qpos) - s.kd * s.qvel
 
-        robot_cmd = sdk_dtype.RobotCmd()
-        robot_cmd.mode = [0.] * 8
-        robot_cmd.q = [0.] * 8
-        robot_cmd.dq = [0.] * 8
-        robot_cmd.tau = [0.] * 8
-        robot_cmd.Kp = [0.] * 8
-        robot_cmd.Kd = [0.] * 8
-
         robot_cmd.q = s.qpos_trg.tolist()
         robot_cmd.Kp = s.kp.tolist()
         robot_cmd.Kd = s.kd.tolist()
         robot.publishRobotCmd(robot_cmd)
+
+        if step_num % LOOP_FREQ == 0:
+            robot.setRobotLightEffect(sdk_dtype.LightEffect.STATIC_WHITE)
+        elif step_num % LOOP_FREQ == LOOP_FREQ // 2:
+            robot.setRobotLightEffect(sdk_dtype.LightEffect.STATIC_GREEN)
+
+        # monitoring
+        total_utils_buff[step_num % LOOP_FREQ] = total_dt * LOOP_FREQ
 
         # logging
         if step_num % log_decimation == 0:
@@ -309,25 +319,30 @@ def run_robofsm_graph(
                 f'[{__name__}]\n'
                 f'step-num: {step_num}\n'
 
-                f'total-util: {total_dt * LOOP_FREQ:.4f} | '
-                f'step-util: {step_dt * LOOP_FREQ:.4f} | '
-                f'sim-util: {sim_dt * LOOP_FREQ:.4f}\n'
+                f'total-util-mean: {sum(total_utils_buff) / LOOP_FREQ:.4f} | '
+                f'total-util-max: {max(total_utils_buff):.4f}\n'
+
+                # f'total-util: {total_dt * LOOP_FREQ:.4f} | '
+                # f'step-util: {step_dt * LOOP_FREQ:.4f} | '
+                # f'sim-util: {sim_dt * LOOP_FREQ:.4f}\n'
 
                 f'quat: {" | ".join([f"{x:6.3f}" for x in s.quat_w])}\n'
-                f'lvel: {" | ".join([f"{x:6.3f}" for x in s.linvel_b])}\n'
-                f'avel: {" | ".join([f"{x:6.3f}" for x in s.angvel_b])}\n'
+                f'lin : {" | ".join([f"{x:6.3f}" for x in s.linvel_b])}\n'
+                f'ang : {" | ".join([f"{x:6.3f}" for x in s.angvel_b])}\n'
                 f'qpos: {" | ".join([f"{x:6.3f}" for x in s.qpos])}\n'
                 f'qvel: {" | ".join([f"{x:6.3f}" for x in s.qvel])}\n'
                 f'qtrg: {" | ".join([f"{x:6.3f}" for x in s.qpos_trg])}\n'
+                f'kp  : {" | ".join([f"{x:6.3f}" for x in s.kp])}\n'
+                f'kd  : {" | ".join([f"{x:6.3f}" for x in s.kd])}\n'
                 f'qtau: {" | ".join([f"{x:6.3f}" for x in qtau])}\n'
+
                 f'axes: {" | ".join([f"{x:6.3f}" for x in cmd_axes.values()])}\n'
                 f'btns: {" | ".join([f"{x:6.3f}" for x in cmd_btns.values()])}\n'
             )
 
         # fix loop delta-time
         step_dt = (time.perf_counter_ns() - step_ns) / 1e9
-        while ((time.perf_counter_ns() - step_ns) / 1e9) * LOOP_FREQ < 1.0:
-            pass
+        rate.sleep()
         total_dt = (time.perf_counter_ns() - step_ns) / 1e9
 
 

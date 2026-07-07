@@ -1,5 +1,0 @@
-
-
-
-class BaseRobotState:
-    pass

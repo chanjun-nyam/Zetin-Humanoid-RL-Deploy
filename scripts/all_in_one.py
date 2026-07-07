@@ -33,7 +33,7 @@ RL_Q_NAMES = [
     'ankle_L_Joint','ankle_R_Joint',
 ]
 
-LOOP_FREQ = 400
+LOOP_FREQ = 300
 POLICY_FREQ = 50
 REND_FREQ = 50
 LOG_FREQ = 10
@@ -185,6 +185,8 @@ def run_robofsm_graph(
     rend_dt = 0.0
     total_dt = 0.0
 
+    total_utils_buff = [0.0] * LOOP_FREQ
+
     usr_axes = [0.5] * 6
     usr_btns = [False] * 4
 
@@ -248,24 +250,33 @@ def run_robofsm_graph(
             _render_callback(mj_model, mj_data)
             rend_dt = (time.perf_counter_ns() - t_ns) / 1e9
 
+        # monitoring
+        total_utils_buff[step_num % LOOP_FREQ] = total_dt * LOOP_FREQ
+
         # logging
         if step_num % log_decimation == 0:
             print(
                 f'[{__name__}]\n'
                 f'step-num: {step_num}\n'
 
-                f'total-util: {total_dt * LOOP_FREQ:.4f} | '
-                f'step-util: {step_dt * LOOP_FREQ:.4f} | '
-                f'sim-util: {sim_dt * LOOP_FREQ:.4f} | '
-                f'rend-util: {rend_dt * LOOP_FREQ:.4f}\n'
+                f'total-util-mean: {sum(total_utils_buff) / LOOP_FREQ:.4f} | '
+                f'total-util-max: {max(total_utils_buff):.4f}\n'
+
+                # f'total-util: {total_dt * LOOP_FREQ:.4f} | '
+                # f'step-util: {step_dt * LOOP_FREQ:.4f} | '
+                # f'sim-util: {sim_dt * LOOP_FREQ:.4f} | '
+                # f'rend-util: {rend_dt * LOOP_FREQ:.4f}\n'
 
                 f'quat: {" | ".join([f"{x:6.3f}" for x in s.quat_w])}\n'
-                f'lvel: {" | ".join([f"{x:6.3f}" for x in s.linvel_b])}\n'
-                f'avel: {" | ".join([f"{x:6.3f}" for x in s.angvel_b])}\n'
+                f'lin : {" | ".join([f"{x:6.3f}" for x in s.linvel_b])}\n'
+                f'ang : {" | ".join([f"{x:6.3f}" for x in s.angvel_b])}\n'
                 f'qpos: {" | ".join([f"{x:6.3f}" for x in s.qpos])}\n'
                 f'qvel: {" | ".join([f"{x:6.3f}" for x in s.qvel])}\n'
                 f'qtrg: {" | ".join([f"{x:6.3f}" for x in s.qpos_trg])}\n'
+                f'kp  : {" | ".join([f"{x:6.3f}" for x in s.kp])}\n'
+                f'kd  : {" | ".join([f"{x:6.3f}" for x in s.kd])}\n'
                 f'qtau: {" | ".join([f"{x:6.3f}" for x in qtau])}\n'
+
                 f'axes: {" | ".join([f"{x:6.3f}" for x in cmd_axes.values()])}\n'
                 f'btns: {" | ".join([f"{x:6.3f}" for x in cmd_btns.values()])}\n'
             )
