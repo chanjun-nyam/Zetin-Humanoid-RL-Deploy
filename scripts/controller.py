@@ -1,5 +1,6 @@
 import time
 import copy
+import math
 
 import torch as th
 
@@ -15,6 +16,7 @@ from robofsm.bipedal import (
     RLPolicy,
     RLPolicyCfg,
 )
+from robofsm.utils.math import quat_apply, vec_dot
 
 
 
@@ -29,9 +31,11 @@ RL_Q_NAMES = [
     'ankle_L_Joint','ankle_R_Joint',
 ]
 
-LOOP_FREQ = 300
+LOOP_FREQ = 500
 POLICY_FREQ = 50
 LOG_FREQ = 10
+
+MODEL_PATH = 'models/tron1_s_flat.onnx'
 
 
 
@@ -57,7 +61,7 @@ def build_robofsm_graph():
 
         qpos_def=tensor([0] * 8),
         kp_def=tensor([45., 45., 45., 45., 45., 45., 45., 45.]),
-        kd_def=tensor([1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 0.8, 0.8]),
+        kd_def=tensor([1.5, 1.5, 1.5, 0.8, 1.5, 1.5, 1.5, 0.8]),
     )
 
     # build: rl-policy
@@ -68,20 +72,19 @@ def build_robofsm_graph():
         q_names=RL_Q_NAMES,
         qpos_def=robot_state.qpos_def.tolist(),
         n_history=10,
-        obs_scale=[0.25, 1.0, 1.0, 0.05, 1.0, 1.0],
         action_scale=[0.5] * 8,
-        obs_clip=(-100.0, 100.0),
-        action_clip=(-100.0, 100.0),
+        obs_clip=(-1e6, 1e6),
+        action_clip=(-1e6, 1e6),
         cmd_rng=[
             (-1.5, 1.5), # linvel-x
             (-1.0, 1.0), # linvel-y
             (-1.0, 1.0), # angvel-z
             (0.8, 1.6), # gait freq
-            (0.4, 0.6), # gait ratio
-            (th.pi/2, th.pi/2), # gait offset
+            (0.5, 0.5), # gait ratio
+            (th.pi, th.pi), # gait offset
         ],
-        # model_path='models/tron1_s_flat.onnx',
-        model_path='models/tron1_s_rough.onnx',
+        max_stride=1.2,
+        model_path=MODEL_PATH,
     ))
 
     # build: fsm nodes
@@ -123,7 +126,7 @@ def build_robofsm_graph():
     )
     soft_stop_node.add_edge(
         id='run rl-policy', ord=1, next=rl_policy_node,
-        fn=lambda: btns['rl-run'] and soft_stop_node.t > 5.0,
+        fn=lambda: btns['rl-run'] and soft_stop_node.t > 3.0,
     )
 
     rl_policy_node.add_edge(
@@ -133,6 +136,12 @@ def build_robofsm_graph():
     rl_policy_node.add_edge(
         id='emergency soft-stop', ord=1, next=soft_stop_node,
         fn=lambda: btns['soft-stop'],
+    )
+    rl_policy_node.add_edge(
+        id='tilt soft-stop', ord=2, next=soft_stop_node,
+        fn=lambda: float(vec_dot(
+            quat_apply(soft_stop_node.state.quat_w, tensor([0, 0, 1])), tensor([0, 0, 1])
+        ).item()) < math.cos(math.radians(60.0))
     )
 
     return hard_stop_node, cmd, rl_cmd

@@ -6,9 +6,12 @@ readme = "README.md"
 requires-python = "~=3.11.0"
 dependencies = [
     "mujoco>=3.10.0",
+    "onnx>=1.22.0",
     "opencv-python-headless>=5.0.0.93",
     "pillow>=12.3.0",
     "robofsm",
+    "simple-rl",
+    "typer>=0.26.8",
 ]
 
 [tool.uv.workspace]
@@ -18,3 +21,4 @@ members = [
 
 [tool.uv.sources]
 robofsm = { workspace = true, editable = true }
+simple-rl = { git = "https://github.com/chanjun-nyam/Simple-RL.git" }

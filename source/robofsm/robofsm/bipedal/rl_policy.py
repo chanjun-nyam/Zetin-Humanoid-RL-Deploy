@@ -5,7 +5,7 @@ import torch as th
 import onnxruntime as ort
 
 from robofsm.utils.buffer import HistoryBuffer, SMABuffer
-from robofsm.utils.math import quat_apply, quat_conj
+from robofsm.utils.math import vec_norm, quat_apply, quat_conj
 
 
 
@@ -24,8 +24,6 @@ class RLPolicyCfg:
 
     n_history: int = MISSING
 
-    obs_scale: List[float] = MISSING
-
     action_scale: List[float] = MISSING
 
     obs_clip: Tuple[float, float] = MISSING
@@ -33,6 +31,8 @@ class RLPolicyCfg:
     action_clip: Tuple[float, float] = MISSING
 
     cmd_rng: List[Tuple[float, float]] = MISSING
+
+    max_stride: float = MISSING
 
     model_path: str = MISSING
 
@@ -97,8 +97,6 @@ class RLPolicy:
         n_obs_t = 6 + n_qdim * 3
         n_obs_priv = 3
 
-        obs_dims = [3, 3, n_qdim, n_qdim, n_qdim, 3]
-
         tensor = self._tensor
 
         # robot data
@@ -107,7 +105,6 @@ class RLPolicy:
         self.qpos_def = tensor(self.cfg.qpos_def)
 
         self.root_quat_w = self.QUAT_IDENTITY.clone()
-        self.root_linvel_b = SMABuffer.init_like(tensor([0, 0, 0]), (0,), self.decimation)
         self.root_angvel_b = SMABuffer.init_like(tensor([0, 0, 0]), (0,), self.decimation)
         self.gravity_dir_b = self.GRAVITY_DIR_W.clone()
         self.qpos = tensor([0] * n_qdim)
@@ -117,14 +114,15 @@ class RLPolicy:
         self.cmd_rng = tensor(self.cfg.cmd_rng)
 
         self.is_walk = tensor(False, dtype=th.bool)
-        self.cmd = tensor([0, 0, 0, 0, 0.5, th.pi])
+        self.cmd = tensor([0, 0, 0, 0, 0, 0])
 
         # gait
+        self.gait_freq = tensor(0)
         self.gait_clock = tensor(0)
-        self.gait_clock_signal = tensor([0, 0, 0, 0])
+        self.gait_ratio = tensor(0)
+        self.gait_theta = tensor([0, 0])
 
         # others
-        self.obs_scale = tensor(sum([[s] * obs_dims[i] for i, s in enumerate(self.cfg.obs_scale)], []))
         self.action_scale = tensor(self.cfg.action_scale)
 
         self.action = tensor([0] * n_qdim)
@@ -132,11 +130,8 @@ class RLPolicy:
 
 
     def _reset_buff(self):
-        tensor = self._tensor
-
         # robot data
         self.root_quat_w.copy_(self.QUAT_IDENTITY)
-        self.root_linvel_b.reset(())
         self.root_angvel_b.reset(())
         self.gravity_dir_b.copy_(self.GRAVITY_DIR_W)
         self.qpos.zero_()
@@ -144,11 +139,12 @@ class RLPolicy:
 
         # command
         self.is_walk.zero_()
-        self.cmd.copy_(tensor([0, 0, 0, 0, 0.5, th.pi])) # TODO
+        self.cmd.zero_()
 
         # gait
+        self.gait_freq.zero_()
         self.gait_clock.zero_()
-        self.gait_clock_signal.zero_()
+        self.gait_ratio.zero_()
 
         # others
         self.action.zero_()
@@ -158,7 +154,6 @@ class RLPolicy:
     def step(
             self,
             quat: th.Tensor,
-            linvel: th.Tensor,
             angvel: th.Tensor,
             qpos: th.Tensor,
             qvel: th.Tensor,
@@ -167,7 +162,6 @@ class RLPolicy:
         ) -> th.Tensor:
         # update-buff: robot data
         self.root_quat_w.copy_(quat)
-        self.root_linvel_b.update(linvel)
         self.root_angvel_b.update(angvel)
         self.gravity_dir_b.copy_(
             quat_apply(quat_conj(self.root_quat_w), self.GRAVITY_DIR_W)
@@ -182,22 +176,27 @@ class RLPolicy:
         self.cmd.copy_(
             self.cmd_rng[:,0] + cmd_axes * self.cmd_rng.diff(n=1, dim=-1).squeeze(1)
         )
+        self.cmd.mul_(self.is_walk.unsqueeze(0))
 
         # update-buff: gait
         # TODO
-        self.gait_clock.add_((2.0 * th.pi * (1.0 / self.cfg.step_freq)) * self.cmd[3])
+        self.gait_freq.copy_(self.cmd[3])
+        # clamp required stride distance
+        req_linvel = vec_norm(self.cmd[0:2])
+        self.gait_freq.copy_(th.where(
+            req_linvel / self.gait_freq.clip(min=1e-6) > self.cfg.max_stride,
+            req_linvel / self.cfg.max_stride,
+            self.gait_freq,
+        ))
+
+        self.gait_clock.add_((2.0 * th.pi * (1.0 / self.cfg.step_freq)) * self.gait_freq)
         self.gait_clock.remainder_(2.0 * th.pi)
 
-        gait_theta = self.gait_clock.repeat(2).clone()
-        gait_theta[0] += 0.0
-        gait_theta[1] += self.cmd[5]
-        self.gait_clock_signal.copy_(th.cat([gait_theta.sin(), gait_theta.cos()]))
+        self.gait_ratio.copy_(self.cmd[4])
 
-        # apply `is_walk`
-        self.cmd[0:3] *= self.is_walk
-        # self.cmd *= self.is_walk
-        self.cmd[3] *= self.is_walk # TODO
-        self.gait_clock_signal *= self.is_walk
+        self.gait_theta[0].copy_(self.gait_clock)
+        self.gait_theta[1].copy_(self.gait_clock + self.cmd[5])
+        self.gait_theta.remainder_(2.0 * th.pi)
 
         # policy step
         if self.step_idx % self.decimation == self.decimation - 1:
@@ -211,31 +210,39 @@ class RLPolicy:
 
 
     def _policy_step(self):
-        # compute observation tensor
-        self.obs_hist.update(
-            th.cat([
-                self.root_angvel_b.sma,
-                self.gravity_dir_b,
-                self.qpos,
-                self.qvel.sma,
-                self.action,
-            ], dim=-1) * self.obs_scale[:-3]
-        )
-        obs_priv = th.cat([
-            self.root_linvel_b.sma,
-        ], dim=-1) * self.obs_scale[-3:]
-
-        obs_tensor = th.cat([
-            self.obs_hist.buff.view(-1),
-            self.cmd[0:5],
-            self.gait_clock_signal,
-            obs_priv,
+        # compute observation tensors/buffers
+        obs_hist_t = th.cat([
+            self.root_angvel_b.sma * 0.25,
+            self.gravity_dir_b,
+            self.qpos,
+            self.qvel.sma * 0.05,
+            self.action,
         ], dim=-1)
-        obs_tensor.clip_(*self.cfg.obs_clip)
-        obs_tensor[-3:] = 0.0 # TODO: implement linvel estimator
+
+        self.obs_hist.update(obs_hist_t)
+        obs_hist = self.obs_hist.buff # (n_history, n_obs_hist_t)
+
+        obs_cmd = th.cat([
+            self.cmd[0:3],
+            self.gait_freq.unsqueeze(0),
+            self.gait_ratio.unsqueeze(0),
+            self.gait_theta.sin() * self.is_walk.unsqueeze(0),
+            self.gait_theta.cos() * self.is_walk.unsqueeze(0),
+        ], dim=-1)
+
+        # final observation
+        observation = {
+            'obs_hist_t': obs_hist_t,
+            'obs_hist': obs_hist,
+            'obs_cmd': obs_cmd,
+        }
+        observation = th.cat([
+            observation['obs_hist'].view(-1),
+            observation['obs_cmd'],
+        ], dim=-1).clip(*self.cfg.obs_clip) # TODO
 
         # run onnx session
-        session_input = {'input': obs_tensor.unsqueeze(0).numpy()}
+        session_input = {'input': observation.unsqueeze(0).numpy()}
         session_output = self.session.run(['output'], session_input)
 
         # compute action tensor

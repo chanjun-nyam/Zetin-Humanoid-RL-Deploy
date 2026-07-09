@@ -13,10 +13,11 @@ class _TimerNode(BaseNode[RobotState]):
         super().__init__(state)
 
     def on_enter(self):
-        self.t = time.perf_counter()
+        self.t0 = time.perf_counter()
+        self.t = 0.0
 
     def on_update(self):
-        new_t = time.perf_counter()
+        new_t = time.perf_counter() - self.t0
         self.dt = new_t - self.t
         self.t = new_t
 
@@ -26,7 +27,11 @@ class HardStopNode(_TimerNode):
     def __init__(self, state: RobotState):
         super().__init__(state)
 
+    def on_enter(self):
+        super().on_enter()
+
     def on_update(self):
+        super().on_update()
         self.state.kp.zero_()
         self.state.kd.zero_()
 
@@ -96,9 +101,8 @@ class RLPolicyNode(_TimerNode):
         s = self.state
         qpos_trg = self.rl_policy.step(
             quat=s.quat_w,
-            linvel=s.linvel_b,
             angvel=s.angvel_b,
-            qpos=s.qpos[self.from_q_ref],
+            qpos=s.qpos[self.from_q_ref]-s.qpos_def[self.from_q_ref],
             qvel=s.qvel[self.from_q_ref],
             cmd_axes=self.cmd_axes,
             cmd_btns=self.cmd_btns,
