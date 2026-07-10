@@ -36,6 +36,8 @@ POLICY_FREQ = 50
 LOG_FREQ = 10
 
 MODEL_PATH = 'models/tron1_s_flat.onnx'
+ROBOT_IP = '127.0.0.1'
+ROBOT_IP = '10.192.1.2'
 
 
 
@@ -351,6 +353,10 @@ def run_robofsm_graph(
 
                 f'axes: {" | ".join([f"{x:6.3f}" for x in cmd_axes.values()])}\n'
                 f'btns: {" | ".join([f"{x:6.3f}" for x in cmd_btns.values()])}\n'
+
+                f'diagnostic-value | '
+                f'level: {diagnostic_value.level} | name: {diagnostic_value.level} | '
+                f'code: {diagnostic_value.code} | message: {diagnostic_value.message}\n'
             )
 
         # fix loop delta-time
@@ -366,6 +372,5 @@ if __name__ == '__main__':
 
     run_robofsm_graph(
         *build_robofsm_graph(),
-        robot_ip='127.0.0.1',
-        # robot_ip='10.192.1.2',
+        robot_ip=ROBOT_IP,
     )
